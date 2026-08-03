@@ -26,9 +26,15 @@ class DocumentListResponse(BaseModel):
     total: int = Field(description="文档总数")
 
 
+class ChatMessage(BaseModel):
+    role: str = Field(description="消息角色，user 或 assistant")
+    content: str = Field(description="消息内容")
+
+
 class ChatRequest(BaseModel):
     query: str = Field(min_length=1, description="用户问题")
     top_k: int | None = Field(default=None, ge=1, le=20, description="检索返回的文档块数量，默认取配置值 5")
+    history: list[ChatMessage] = Field(default_factory=list, description="历史对话（不含当前问题），用于多轮上下文")
 
 
 class ChatResponse(BaseModel):

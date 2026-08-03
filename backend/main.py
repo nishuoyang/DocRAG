@@ -1,9 +1,11 @@
 """FastAPI 应用入口。"""
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from api import chat, documents
 from db import milvus
@@ -45,3 +47,10 @@ app.include_router(chat.router)
 async def health():
     """健康检查。"""
     return {"status": "ok"}
+
+
+# 生产模式：托管前端构建产物（frontend/dist 存在时生效）。
+# 注意：必须放在所有 API 路由之后，否则会抢占 /health 等路径。
+frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.isdir(frontend_dist):
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")

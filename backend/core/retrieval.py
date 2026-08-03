@@ -17,6 +17,10 @@ SYSTEM_PROMPT = """你是垂直领域的智能问答助手。基于提供的参�
 """
 
 
+# 最多携带最近 6 轮历史对话，避免上下文过长稀释检索结果
+MAX_HISTORY_TURNS = 6
+
+
 def _format_context(docs: list[Document]) -> str:
     """把检索结果拼成上下文文本。"""
     parts = []
@@ -26,14 +30,17 @@ def _format_context(docs: list[Document]) -> str:
     return "\n\n".join(parts)
 
 
-def _build_messages(query: str, docs: list[Document]) -> list[dict]:
-    return [
+def _build_messages(query: str, docs: list[Document], history: list[dict] | None = None) -> list[dict]:
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT.format(context=_format_context(docs))},
-        {"role": "user", "content": query},
     ]
+    for turn in history or []:
+        messages.append({"role": turn.get("role"), "content": turn.get("content")})
+    messages.append({"role": "user", "content": query})
+    return messages
 
 
-def rag_query(query: str, top_k: int | None = None) -> dict:
+def rag_query(query: str, top_k: int | None = None, history: list[dict] | None = None) -> dict:
     """单轮 RAG 问答：检索 → 生成 → 返回答案与引用来源。"""
     docs = milvus.similarity_search(query, k=top_k)
     if not docs:
@@ -42,7 +49,7 @@ def rag_query(query: str, top_k: int | None = None) -> dict:
             "sources": [],
         }
     chat = llm.get_llm()
-    messages = _build_messages(query, docs)
+    messages = _build_messages(query, docs, history[-MAX_HISTORY_TURNS * 2 :] if history else None)
     response = chat.invoke(messages)
     sources = [
         {
@@ -56,14 +63,14 @@ def rag_query(query: str, top_k: int | None = None) -> dict:
     return {"answer": response.content, "sources": sources}
 
 
-async def rag_stream(query: str, top_k: int | None = None):
+async def rag_stream(query: str, top_k: int | None = None, history: list[dict] | None = None):
     """流式 RAG 问答：检索后以 SSE 形式流式输出 LLM 回答。"""
     docs = milvus.similarity_search(query, k=top_k)
     if not docs:
         yield f'data: {json.dumps({"answer": "资料库中尚未检索到相关内容，请先上传文档或调整问题表述。"})}\n\n'
         return
     chat = llm.get_llm()
-    messages = _build_messages(query, docs)
+    messages = _build_messages(query, docs, history[-MAX_HISTORY_TURNS * 2 :] if history else None)
     sources = [
         {
             "filename": d.metadata.get("filename", "未知来源"),
