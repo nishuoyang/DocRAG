@@ -1,0 +1,50 @@
+"""应用配置。环境变量经 .env 加载，未设置的用 .env.example 中的默认值。"""
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # Milvus
+    MILVUS_HOST: str = "localhost"
+    MILVUS_PORT: int = 19530
+    MILVUS_COLLECTION: str = "doc_collection"
+
+    # Embedding (OpenAI 兼容 API)
+    EMBEDDING_BASE_URL: str = "https://api.siliconflow.cn/v1"
+    EMBEDDING_API_KEY: str = ""
+    EMBEDDING_MODEL: str = "BAAI/bge-large-zh-v1.5"
+    EMBEDDING_DIM: int = 1024  # bge-large-zh-v1.5 输出 1024 维
+
+    # LLM
+    LLM_PROVIDER: str = "siliconflow"
+    LLM_API_KEY: str = ""
+    LLM_MODEL: str = "deepseek-ai/DeepSeek-V3"
+    LLM_BASE_URL: str = ""
+    LLM_TEMPERATURE: float = 0.1
+
+    # 检索与分块
+    CHUNK_SIZE: int = 500
+    CHUNK_OVERLAP: int = 50
+    TOP_K: int = 5
+
+    # 上传限制 (MB)
+    MAX_UPLOAD_MB: int = 20
+
+    @property
+    def llm_base_url(self) -> str:
+        """根据 LLM_PROVIDER 解析 base_url，custom 时读 LLM_BASE_URL。"""
+        if self.LLM_PROVIDER == "custom" and self.LLM_BASE_URL:
+            return self.LLM_BASE_URL
+        return {
+            "siliconflow": "https://api.siliconflow.cn/v1",
+            "openai": "https://api.openai.com/v1",
+            "deepseek": "https://api.deepseek.com/v1",
+        }[self.LLM_PROVIDER]
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

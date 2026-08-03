@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 环境配置
+.env
+
+# Milvus 数据卷
+volumes/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/

@@ -1,0 +1,47 @@
+"""FastAPI 应用入口。"""
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from api import chat, documents
+from db import milvus
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        milvus.ensure_collection_ready()
+        logger.info("Milvus 连接成功，Collection 就绪")
+    except Exception as exc:
+        logger.warning("Milvus 未就绪（请确认已执行 docker compose up -d）: %s", exc)
+    yield
+
+
+app = FastAPI(
+    title="垂直领域智能文档问答系统",
+    description="基于 LangChain + Milvus 的 RAG 问答后端。上传 PDF/DOCX 文档后即可基于文档内容提问。",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(documents.router)
+app.include_router(chat.router)
+
+
+@app.get("/health", tags=["系统"])
+async def health():
+    """健康检查。"""
+    return {"status": "ok"}
