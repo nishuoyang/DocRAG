@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "BAAI/bge-large-zh-v1.5"
     EMBEDDING_DIM: int = 1024  # bge-large-zh-v1.5 输出 1024 维
 
+    # Rerank 重排序（默认复用 Embedding 的 base_url 与 key；不配 key 或关闭开关则跳过重排）
+    RERANK_ENABLED: bool = True
+    RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    RERANK_API_KEY: str = ""
+
     # LLM
     LLM_PROVIDER: str = "siliconflow"
     LLM_API_KEY: str = ""

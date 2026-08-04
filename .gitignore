@@ -7,6 +7,9 @@ venv/
 # 环境配置
 .env
 
+# SQLite 对话记忆
+backend/chat_memory.db
+
 # Milvus 数据卷
 volumes/
 

@@ -29,6 +29,11 @@ export function deleteDocument(filename) {
   return request(`/documents/${encodeURIComponent(filename)}`, { method: 'DELETE' })
 }
 
+// 获取历史对话记忆（后端 SQLite 持久化，刷新页面后恢复）
+export function getMemory() {
+  return request('/chat/memory')
+}
+
 export function chat(query, topK, history = []) {
   return request('/chat', {
     method: 'POST',

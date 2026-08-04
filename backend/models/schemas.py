@@ -40,3 +40,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str = Field(description="LLM 生成的回答")
     sources: list[Source] = Field(description="回答引用的文档块来源")
+
+
+class MemoryResponse(BaseModel):
+    messages: list[ChatMessage] = Field(description="历史对话消息（按时间升序）")

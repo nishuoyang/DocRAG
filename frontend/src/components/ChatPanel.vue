@@ -1,6 +1,6 @@
 <script setup>
-import { ref, nextTick } from 'vue'
-import { chatStream } from '../api'
+import { ref, nextTick, onMounted } from 'vue'
+import { chatStream, getMemory } from '../api'
 import SourceCard from './SourceCard.vue'
 
 const messages = ref([])
@@ -17,8 +17,7 @@ async function send() {
   const query = input.value.trim()
   if (!query || sending.value) return
 
-  // 历史 = 已完成对话的 role/content，不含当前问题
-  const history = messages.value.map(({ role, content }) => ({ role, content }))
+  // 历史由后端从 SQLite 记忆读取，前端不再随请求携带
   const userMsg = { role: 'user', content: query }
   messages.value.push(
     userMsg,
@@ -53,7 +52,7 @@ async function send() {
       pending += text
       if (!typingTimer) typingTimer = setInterval(tick, TYPING_MS)
     }
-    const { answer, sources } = await chatStream(query, topK.value, onDelta, history)
+    const { answer, sources } = await chatStream(query, topK.value, onDelta)
     if (typingTimer) clearInterval(typingTimer)
     typingTimer = null
     flush()
@@ -87,6 +86,19 @@ function onKeydown(e) {
 function clearChat() {
   messages.value = []
 }
+
+// 页面加载时从后端恢复历史对话（SQLite 持久化）
+onMounted(async () => {
+  try {
+    const { messages: saved } = await getMemory()
+    if (saved?.length) {
+      messages.value = saved.map((m) => ({ ...m, sources: [], streaming: false }))
+      scrollToBottom()
+    }
+  } catch {
+    /* 后端不可达时静默，保持空对话 */
+  }
+})
 </script>
 
 <template>
