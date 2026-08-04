@@ -9,7 +9,7 @@ const message = ref('')
 const dragOver = ref(false)
 const fileInput = ref(null)
 
-const ALLOWED = ['pdf', 'docx']
+const ALLOWED = ['pdf', 'docx', 'txt', 'md', 'csv', 'xlsx', 'pptx']
 
 async function refresh() {
   loading.value = true
@@ -90,10 +90,10 @@ onMounted(refresh)
       @drop.prevent="onDrop"
       @click="fileInput.click()"
     >
-      <input ref="fileInput" type="file" accept=".pdf,.docx" class="hidden" @change="onFileChange" />
+      <input ref="fileInput" type="file" accept=".pdf,.docx,.txt,.md,.csv,.xlsx,.pptx" class="hidden" @change="onFileChange" />
       <div class="text-4xl mb-2">{{ uploading ? '⏳' : '📤' }}</div>
       <p class="text-gray-600">{{ uploading ? '正在解析并入库...' : '点击或拖拽文件到此处上传' }}</p>
-      <p class="mt-1 text-xs text-gray-400">支持 PDF / DOCX，单文件不超过 20MB</p>
+      <p class="mt-1 text-xs text-gray-400">支持 PDF / DOCX / TXT / MD / CSV / XLSX / PPTX，单文件不超过 20MB</p>
     </div>
 
     <!-- 文档列表 -->

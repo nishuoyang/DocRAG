@@ -14,8 +14,9 @@ async def upload_document(file: UploadFile = File(description="要上传的文�
     settings = get_settings()
     filename = file.filename or ""
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
-    if ext not in ("pdf", "docx"):
-        raise HTTPException(status_code=400, detail="仅支持 PDF / DOCX 文件")
+    supported = {e.lstrip(".") for e in ingestion.SUPPORTED_EXTENSIONS} | {"xlsx", "pptx"}
+    if ext not in supported:
+        raise HTTPException(status_code=400, detail=f"仅支持 {', '.join(sorted(supported))} 文件")
 
     content = await file.read()
     size_mb = len(content) / (1024 * 1024)

@@ -9,6 +9,10 @@ const sending = ref(false)
 const topK = ref(5)
 const scrollBox = ref(null)
 
+// 打字机渲染间隔（毫秒/字）。真实流式时 chunk 到达 ~25ms，16ms/字不会形成瓶颈；
+// API 聚合推来的大段文本则被逐字刷出，保持流式观感。
+const TYPING_MS = 16
+
 async function send() {
   const query = input.value.trim()
   if (!query || sending.value) return
@@ -16,21 +20,49 @@ async function send() {
   // 历史 = 已完成对话的 role/content，不含当前问题
   const history = messages.value.map(({ role, content }) => ({ role, content }))
   const userMsg = { role: 'user', content: query }
-  const aiMsg = { role: 'assistant', content: '', sources: [], streaming: true }
-  messages.value.push(userMsg, aiMsg)
+  messages.value.push(
+    userMsg,
+    { role: 'assistant', content: '', sources: [], streaming: true }
+  )
+  // 关键：push 后取回数组存储的代理引用——直接引用原对象改 content 不触发 Vue 响应式
+  const aiMsg = messages.value[messages.value.length - 1]
   input.value = ''
   sending.value = true
 
+  // 打字机队列：SSE 到达的文本先入 pending，定时器逐字刷出
+  let pending = ''
+  let typingTimer = null
+
+  const flush = () => {
+    if (pending) {
+      aiMsg.content += pending
+      pending = ''
+    }
+    scrollToBottom()
+  }
+
+  const tick = () => {
+    if (!pending) return
+    aiMsg.content += pending[0]
+    pending = pending.slice(1)
+    scrollToBottom()
+  }
+
   try {
     const onDelta = (text) => {
-      aiMsg.content += text
-      scrollToBottom()
+      pending += text
+      if (!typingTimer) typingTimer = setInterval(tick, TYPING_MS)
     }
     const { answer, sources } = await chatStream(query, topK.value, onDelta, history)
+    if (typingTimer) clearInterval(typingTimer)
+    typingTimer = null
+    flush()
     aiMsg.content = answer || aiMsg.content
     aiMsg.sources = sources
     aiMsg.streaming = false
   } catch (e) {
+    if (typingTimer) clearInterval(typingTimer)
+    typingTimer = null
     aiMsg.content = `出错了：${e.message}`
     aiMsg.streaming = false
   } finally {
@@ -91,7 +123,23 @@ function clearChat() {
               : 'bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm'"
           >
             {{ m.content }}
-            <span v-if="m.streaming" class="inline-block w-1.5 h-4 ml-0.5 bg-blue-400 align-middle animate-pulse" />
+            <!-- 流式生成中 -->
+            <span v-if="m.streaming" class="inline-flex items-center gap-0.5 ml-1 align-middle">
+              <!-- 有内容时显示呼吸光标 -->
+              <span
+                v-if="m.content"
+                class="w-1.5 h-4 bg-blue-400 animate-pulse inline-block"
+              />
+              <!-- 无内容时显示思考中动画（首 token 前） -->
+              <span v-else class="inline-flex gap-1">
+                <span
+                  v-for="n in 3"
+                  :key="n"
+                  class="w-1.5 h-1.5 rounded-full bg-blue-400"
+                  :style="{ animation: `bounce 1.2s ${(n - 1) * 0.2}s infinite` }"
+                />
+              </span>
+            </span>
           </div>
           <div v-if="m.role === 'assistant' && m.sources?.length" class="mt-2 space-y-2">
             <p class="text-xs text-gray-400">📎 引用来源（{{ m.sources.length }} 条）</p>

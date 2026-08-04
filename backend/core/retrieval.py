@@ -1,4 +1,5 @@
 """检索 + RAG 生成：检索相似块 → 拼上下文 → LLM 生成带来源的回答。"""
+import asyncio
 import json
 
 from langchain_core.documents import Document
@@ -65,7 +66,8 @@ def rag_query(query: str, top_k: int | None = None, history: list[dict] | None =
 
 async def rag_stream(query: str, top_k: int | None = None, history: list[dict] | None = None):
     """流式 RAG 问答：检索后以 SSE 形式流式输出 LLM 回答。"""
-    docs = milvus.similarity_search(query, k=top_k)
+    # similarity_search 内部含同步 embedding API 调用，放线程池执行避免阻塞事件循环
+    docs = await asyncio.to_thread(milvus.similarity_search, query, k=top_k)
     if not docs:
         yield f'data: {json.dumps({"answer": "资料库中尚未检索到相关内容，请先上传文档或调整问题表述。"})}\n\n'
         return
