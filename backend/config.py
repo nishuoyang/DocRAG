@@ -34,8 +34,13 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
     TOP_K: int = 5
-    # 语义切分开关：true 时按句子 embedding 相似度断块（更贴合语义但增加 API 调用），false 用固定长度切分
-    SEMANTIC_SPLIT: bool = False
+    # 语义切分开关：auto 时短文档(<AUTO_SEMANTIC_THRESHOLD)用语义切分、长文档固定切分；
+    # true 全部语义、false 全部固定。上传时可被 split_mode 参数覆盖
+    SEMANTIC_SPLIT: str = "auto"
+    AUTO_SEMANTIC_THRESHOLD: int = 3000  # 语义切分的文档长度阈值（字符）
+    # 检索前 Query 增强
+    QUERY_TRANSFORM: bool = True   # LLM 改写 query 为检索友好形式
+    HYDE: bool = True              # HYDE 假想答案检索
 
     # 上传限制 (MB)
     MAX_UPLOAD_MB: int = 20

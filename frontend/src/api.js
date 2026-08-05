@@ -15,9 +15,10 @@ async function request(path, options = {}) {
   return res.json()
 }
 
-export function uploadDocument(file) {
+export function uploadDocument(file, splitMode = 'auto') {
   const form = new FormData()
   form.append('file', file)
+  if (splitMode && splitMode !== 'auto') form.append('split_mode', splitMode)
   return request('/documents/upload', { method: 'POST', body: form })
 }
 

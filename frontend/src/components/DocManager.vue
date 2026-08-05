@@ -10,6 +10,13 @@ const dragOver = ref(false)
 const fileInput = ref(null)
 
 const ALLOWED = ['pdf', 'docx', 'txt', 'md', 'csv', 'xlsx', 'pptx']
+// 切分策略：auto 自动（短文档语义、长文档固定）| semantic | fixed
+const splitMode = ref('auto')
+const SPLIT_OPTIONS = [
+  { value: 'auto', label: '自动（短文档语义 / 长文档固定）' },
+  { value: 'semantic', label: '语义切分（按话题断块）' },
+  { value: 'fixed', label: '固定长度切分（500 字符）' },
+]
 
 async function refresh() {
   loading.value = true
@@ -37,8 +44,9 @@ async function doUpload(file) {
   uploading.value = true
   message.value = ''
   try {
-    const res = await uploadDocument(file)
-    message.value = `上传成功：${res.filename}（${res.chunk_count} 个分块）`
+    const res = await uploadDocument(file, splitMode.value)
+    const label = SPLIT_OPTIONS.find((o) => o.value === res.chunk_type)?.label ?? res.chunk_type
+    message.value = `上传成功：${res.filename}（${res.chunk_count} 个分块，${label}）`
     await refresh()
   } catch (e) {
     message.value = `上传失败: ${e.message}`
@@ -94,6 +102,16 @@ onMounted(refresh)
       <div class="text-4xl mb-2">{{ uploading ? '⏳' : '📤' }}</div>
       <p class="text-gray-600">{{ uploading ? '正在解析并入库...' : '点击或拖拽文件到此处上传' }}</p>
       <p class="mt-1 text-xs text-gray-400">支持 PDF / DOCX / TXT / MD / CSV / XLSX / PPTX，单文件不超过 20MB</p>
+      <div class="mt-3 inline-flex items-center gap-2">
+        <span class="text-xs text-gray-500">切分策略</span>
+        <select
+          v-model="splitMode"
+          class="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white text-gray-700 focus:outline-none focus:border-blue-400"
+          @click.stop
+        >
+          <option v-for="o in SPLIT_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+        </select>
+      </div>
     </div>
 
     <!-- 文档列表 -->

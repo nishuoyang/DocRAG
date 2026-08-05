@@ -19,6 +19,7 @@ class DocumentUploadResponse(BaseModel):
     filename: str = Field(description="已上传的文件名")
     chunk_count: int = Field(description="入库的分块数量")
     ids: list[int] = Field(description="写入 Milvus 的向量 ID 列表")
+    chunk_type: str | None = Field(default=None, description="实际使用的切分策略：semantic / fixed")
 
 
 class DocumentListResponse(BaseModel):

@@ -1,11 +1,12 @@
 """检索 + RAG 生成：检索相似块 → 拼上下文 → LLM 生成带来源的回答。"""
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.documents import Document
 
 from config import get_settings
-from core import bm25, llm, rerank
+from core import bm25, llm, query_transform, rerank
 from db import memory, milvus
 
 SYSTEM_PROMPT = """你是垂直领域的智能问答助手。基于提供的参考资料回答用户问题。
@@ -42,18 +43,39 @@ def _build_messages(query: str, docs: list[Document], history: list[dict] | None
     return messages
 
 
+def _build_search_queries(query: str) -> list[str]:
+    """构造检索查询集：原 query + Query Transformation 改写 + HYDE 假想答案（按开关）。"""
+    settings = get_settings()
+    queries = [query]
+    # 改写与 HYDE 并行调用 LLM（各自独立），失败时内部降级为原 query
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = []
+        if settings.QUERY_TRANSFORM:
+            futures.append(pool.submit(query_transform.transform_query, query))
+        if settings.HYDE:
+            futures.append(pool.submit(query_transform.hyde_query, query))
+        for f in futures:
+            try:
+                q = f.result()
+            except Exception:
+                q = query
+            if q and q != query:
+                queries.append(q)
+    return queries
+
+
 def _retrieve(query: str, top_k: int | None) -> list[Document]:
-    """混合检索：向量检索 + BM25 关键词检索 → 合并去重 → rerank 重排 → 取前 top_k 条。"""
+    """混合检索：Query 增强（改写+HYDE）→ 向量+BM25 多查询召回 → 合并去重 → rerank。"""
     settings = get_settings()
     n = max(top_k or settings.TOP_K, 10)
-    candidates = milvus.similarity_search(query, k=n)  # 向量召回
-    bm25_hits = bm25.keyword_search(query, k=n)         # 关键词召回
-    # 合并去重（按文本内容，向量与 BM25 可能命中同一块）
-    seen = {d.page_content for d in candidates}
-    for d in bm25_hits:
-        if d.page_content not in seen:
-            candidates.append(d)
-            seen.add(d.page_content)
+    candidates: list[Document] = []
+    seen: set[str] = set()
+    for q in _build_search_queries(query):
+        for doc in milvus.similarity_search(q, k=n) + bm25.keyword_search(q, k=n):
+            if doc.page_content not in seen:
+                candidates.append(doc)
+                seen.add(doc.page_content)
+    # rerank 用原始 query（用户原意），保证最终排序贴合意图
     ranked = rerank.rerank(query, candidates, top_n=top_k or settings.TOP_K)
     return ranked or candidates[: top_k or settings.TOP_K]
 

@@ -1,5 +1,5 @@
 """文档管理 API：上传、列表、删除。"""
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from config import get_settings
 from core import ingestion
@@ -9,7 +9,10 @@ router = APIRouter(prefix="/documents", tags=["文档管理"])
 
 
 @router.post("/upload", response_model=DocumentUploadResponse, summary="上传文档并入库")
-async def upload_document(file: UploadFile = File(description="要上传的文档文件，支持 PDF / DOCX")):
+async def upload_document(
+    file: UploadFile = File(description="要上传的文档文件，支持 PDF / DOCX"),
+    split_mode: str | None = Form(default=None, description="切分策略：semantic 语义切分 / fixed 固定长度，不传则自动判断"),
+):
     """上传 PDF 或 DOCX 文档，自动解析、分块、向量化后写入 Milvus。"""
     settings = get_settings()
     filename = file.filename or ""
@@ -17,6 +20,9 @@ async def upload_document(file: UploadFile = File(description="要上传的文�
     supported = {e.lstrip(".") for e in ingestion.SUPPORTED_EXTENSIONS} | {"xlsx", "pptx"}
     if ext not in supported:
         raise HTTPException(status_code=400, detail=f"仅支持 {', '.join(sorted(supported))} 文件")
+
+    if split_mode not in (None, "semantic", "fixed"):
+        raise HTTPException(status_code=400, detail="split_mode 仅支持 semantic / fixed")
 
     content = await file.read()
     size_mb = len(content) / (1024 * 1024)
@@ -27,7 +33,7 @@ async def upload_document(file: UploadFile = File(description="要上传的文�
         )
 
     try:
-        result = ingestion.ingest_file(filename, content)
+        result = ingestion.ingest_file(filename, content, split_mode)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -37,6 +43,7 @@ async def upload_document(file: UploadFile = File(description="要上传的文�
         filename=result["filename"],
         chunk_count=result["chunk_count"],
         ids=result["ids"],
+        chunk_type=result.get("chunk_type"),
     )
 
 

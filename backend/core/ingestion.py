@@ -91,8 +91,8 @@ def _get_loader(file_path: str):
     return lambda p: loader_cls(p, **kwargs).load()
 
 
-def _make_metadata_docs(docs: list[Document], filename: str) -> list[Document]:
-    """为每个文档块补充文件名、上传时间、块序号元数据。"""
+def _make_metadata_docs(docs: list[Document], filename: str, chunk_type: str = "fixed") -> list[Document]:
+    """为每个文档块补充文件名、上传时间、块序号、切分类型元数据。"""
     timestamp = int(time.time())
     enriched: list[Document] = []
     for idx, doc in enumerate(docs):
@@ -100,6 +100,7 @@ def _make_metadata_docs(docs: list[Document], filename: str) -> list[Document]:
             "filename": filename,
             "chunk_index": idx,
             "upload_time": timestamp,
+            "chunk_type": chunk_type,
         }
         page = doc.metadata.get("page")
         if page is not None:
@@ -117,16 +118,31 @@ def _load_documents(file_path: str) -> list[Document]:
     return _get_loader(file_path)(file_path)
 
 
-def _split_documents(docs: list[Document]) -> list[Document]:
+def _resolve_split_mode(docs: list[Document], split_mode: str | None) -> str:
+    """确定切分策略：手动指定优先；否则按配置（auto 时短文档语义、长文档固定）。"""
+    if split_mode in ("semantic", "fixed"):
+        return split_mode
     settings = get_settings()
-    if settings.SEMANTIC_SPLIT:
-        return _semantic_split_documents(docs)
+    mode = str(settings.SEMANTIC_SPLIT).lower()
+    if mode == "auto":
+        total_len = sum(len(d.page_content) for d in docs)
+        return "semantic" if total_len <= settings.AUTO_SEMANTIC_THRESHOLD else "fixed"
+    # 兼容旧布尔配置：true = 全部语义，false = 全部固定
+    return "semantic" if mode == "true" else "fixed"
+
+
+def _split_documents(docs: list[Document], split_mode: str | None = None) -> tuple[list[Document], str]:
+    """切分文档，返回 (切分结果, 实际使用的策略)。"""
+    mode = _resolve_split_mode(docs, split_mode)
+    if mode == "semantic":
+        return _semantic_split_documents(docs), "semantic"
+    settings = get_settings()
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=settings.CHUNK_OVERLAP,
         length_function=len,
     )
-    return splitter.split_documents(docs)
+    return splitter.split_documents(docs), "fixed"
 
 
 # 语义切分：按句子 embedding 相似度断块。
@@ -189,8 +205,8 @@ def _semantic_split_documents(docs: list[Document]) -> list[Document]:
     return result
 
 
-def ingest_file(filename: str, content: bytes) -> dict:
-    """解析上传文件并写入向量库，返回摄入统计。"""
+def ingest_file(filename: str, content: bytes, split_mode: str | None = None) -> dict:
+    """解析上传文件并写入向量库，返回摄入统计。split_mode: semantic | fixed | None(自动)。"""
     ext = Path(filename).suffix.lower()
     suffix = ext if ext in SUPPORTED_EXTENSIONS or ext in (".xlsx", ".pptx") else ".bin"
     # PyPDFLoader / Docx2txtLoader 需要文件路径，写临时文件
@@ -201,13 +217,14 @@ def ingest_file(filename: str, content: bytes) -> dict:
         raw_docs = _load_documents(tmp_path)
         if not raw_docs:
             raise ValueError("文档内容为空或无法解析")
-        split_docs = _split_documents(raw_docs)
-        enriched = _make_metadata_docs(split_docs, filename)
+        split_docs, used_mode = _split_documents(raw_docs, split_mode)
+        enriched = _make_metadata_docs(split_docs, filename, chunk_type=used_mode)
         ids = milvus.add_documents(enriched)
         return {
             "ids": ids,
             "chunk_count": len(enriched),
             "filename": filename,
+            "chunk_type": used_mode,
         }
     finally:
         if os.path.exists(tmp_path):

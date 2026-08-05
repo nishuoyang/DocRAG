@@ -6,6 +6,7 @@ import re
 
 from langchain_milvus import Milvus
 from langchain_core.documents import Document
+from pymilvus import DataType
 
 from config import get_settings
 from core.embeddings import get_embeddings
@@ -19,7 +20,11 @@ def get_collection_name() -> str:
 
 
 def get_vectorstore() -> Milvus:
-    """返回已连接的 Milvus vectorstore（自动创建 Collection）。"""
+    """返回已连接的 Milvus vectorstore（自动创建 Collection）。
+
+    显式声明 metadata schema：chunk_type（semantic/fixed）在新 collection 中
+    成为正式字段；旧 collection（无此字段）中该元数据会丢失。
+    """
     settings = get_settings()
     return Milvus(
         embedding_function=get_embeddings(),
@@ -30,6 +35,9 @@ def get_vectorstore() -> Milvus:
         collection_name=get_collection_name(),
         auto_id=True,
         drop_old=False,
+        metadata_schema={
+            "chunk_type": {"dtype": DataType.VARCHAR, "max_length": 32},
+        },
     )
 
 
@@ -49,13 +57,19 @@ def similarity_search(query: str, k: int | None = None) -> list[Document]:
 def get_all_documents() -> list[Document]:
     """返回集合中全部文档块（用于文档列表接口，按 chunk 去重为文件）。"""
     vs = get_vectorstore()
+    # collection 尚未创建（首次上传前）→ 返回空列表
+    if vs.col is None:
+        return []
     # Milvus 分页取全部数据
     documents: list[Document] = []
     offset = 0
     limit = 100
     while True:
         batch = vs.col.query(
-            expr="", output_fields=["pk", "text", "filename", "chunk_index", "upload_time"], limit=limit, offset=offset
+            expr="",
+            output_fields=["pk", "text", "filename", "chunk_index", "upload_time", "chunk_type"],
+            limit=limit,
+            offset=offset,
         )
         if not batch:
             break
@@ -68,6 +82,7 @@ def get_all_documents() -> list[Document]:
                         "filename": item.get("filename", ""),
                         "chunk_index": item.get("chunk_index"),
                         "upload_time": item.get("upload_time"),
+                        "chunk_type": item.get("chunk_type"),
                     },
                 )
             )
@@ -80,6 +95,8 @@ def get_all_documents() -> list[Document]:
 def delete_document(file_name: str) -> int:
     """按文件名删除文档的全部块，返回删除条数。"""
     vs = get_vectorstore()
+    if vs.col is None:
+        return 0
     result = vs.col.delete(expr=f'filename == "{file_name}"')
     return result.delete_count if result else 0
 
