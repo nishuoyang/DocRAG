@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
     TOP_K: int = 5
+    # 语义切分开关：true 时按句子 embedding 相似度断块（更贴合语义但增加 API 调用），false 用固定长度切分
+    SEMANTIC_SPLIT: bool = False
 
     # 上传限制 (MB)
     MAX_UPLOAD_MB: int = 20

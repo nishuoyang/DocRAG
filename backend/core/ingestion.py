@@ -1,10 +1,12 @@
 """文档摄入：解析文件 → 分块 → 写入 Milvus。"""
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from langchain_community.document_loaders import (
     BSHTMLLoader,
@@ -18,6 +20,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pptx import Presentation
 
 from config import get_settings
+from core.embeddings import get_embeddings
 from db import milvus
 
 logger = logging.getLogger(__name__)
@@ -116,12 +119,74 @@ def _load_documents(file_path: str) -> list[Document]:
 
 def _split_documents(docs: list[Document]) -> list[Document]:
     settings = get_settings()
+    if settings.SEMANTIC_SPLIT:
+        return _semantic_split_documents(docs)
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=settings.CHUNK_OVERLAP,
         length_function=len,
     )
     return splitter.split_documents(docs)
+
+
+# 语义切分：按句子 embedding 相似度断块。
+# 与固定长度切分不同，断点落在"语义断裂处"（如话题切换），块内内容更连贯。
+# 代价：每个文档的所有句子都要调一次 embedding API（计费 + 耗时）。
+_SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?；;])\s*|(?<=\n)\s*")
+_MIN_SEMANTIC_CHUNK = 40  # 语义块最小长度（字符），低于此的断点合并，防碎块
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按中英文句末标点/换行切句，过滤空句。"""
+    parts = _SENTENCE_SPLIT.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _semantic_split_documents(docs: list[Document]) -> list[Document]:
+    """语义切分：句子 → embedding → 相邻相似度低处断块 → 过长块兜底再切。"""
+    settings = get_settings()
+    embeddings = get_embeddings()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP,
+        length_function=len,
+    )
+    result: list[Document] = []
+    for doc in docs:
+        sents = _split_sentences(doc.page_content)
+        if len(sents) < 2:
+            result.append(doc)
+            continue
+        # 批量 embedding（分批，防止超长文本一次调用过多）
+        vecs: list[list[float]] = []
+        batch = 64
+        for i in range(0, len(sents), batch):
+            vecs.extend(embeddings.embed_documents(sents[i : i + batch]))
+        arr = np.array(vecs)
+        # 相邻句余弦相似度（归一化后点积）
+        norm = arr / np.linalg.norm(arr, axis=1, keepdims=True)
+        sims = np.sum(norm[:-1] * norm[1:], axis=1)
+        # 断点：相似度低于 均值-1.5σ 的位置（语义断裂处）
+        threshold = sims.mean() - 1.5 * sims.std()
+        breaks = [i for i, s in enumerate(sims) if s < threshold]
+        # 按断点合并句子成块；断点距当前块起点过近则跳过（防碎块）
+        chunks = []
+        start = 0
+        for b in breaks + [len(sents) - 1]:
+            text = "".join(sents[start : b + 1])
+            if text and len(text) >= _MIN_SEMANTIC_CHUNK:
+                chunks.append(text)
+                start = b + 1
+        if start < len(sents):  # 尾部不足最小长度的句子并入最后一块，不丢弃
+            chunks.append("".join(sents[start:]))
+        # 过长的语义块用固定长度切分兜底（语义块可能 > CHUNK_SIZE×2）
+        for text in chunks:
+            if len(text) > settings.CHUNK_SIZE * 2:
+                sub_docs = splitter.create_documents([text])
+                result.extend(sub_docs)
+            else:
+                result.append(Document(page_content=text))
+    return result
 
 
 def ingest_file(filename: str, content: bytes) -> dict:
