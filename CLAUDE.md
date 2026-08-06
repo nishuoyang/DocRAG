@@ -28,6 +28,12 @@ cd frontend && npm run build
 
 # 测试：无测试套件。手工验证链路：curl /health → POST /documents/upload → POST /chat/stream
 # 清空对话记忆：删 backend/chat_memory.db（或在 Python 里调 db.memory.clear_messages()）
+
+# RAGAS 评估（独立 venv，不污染主环境；生成结果缓存在 backend/.ragas_cache.json）
+cd backend && ./.venv-ragas/Scripts/python.exe -X utf8 scripts/eval_ragas.py
+#   RAGAS_TESTSET=docs/test2.py   换测试集（默认 docs/test.py）
+#   RAGAS_NO_CACHE=1              换文档库/检索参数后必须加（强制重新走检索链路）
+#   RAGAS_CACHE=<path>            改缓存路径
 ```
 
 环境配置从 `.env` 读取（参考 `backend/.env.example`，含 Milvus 地址、LLM/Embedding 的 API Key、模型名、分块参数）。API Key 不提交进 git。
@@ -57,6 +63,12 @@ cd frontend && npm run build
 - `db/memory.py` — SQLite 单表持久化对话（最近 100 条 = 50 轮，自动截断），单连接 `check_same_thread=False`
 - `models/schemas.py` — Pydantic 模型（请求/响应，含 Swagger 描述）
 - `config.py` — `Settings`（pydantic-settings）+ `get_settings()` 缓存。**改 .env 后需重启进程，lru_cache 不自动刷新**
+
+### 评估 `backend/scripts/`
+
+- `eval_ragas.py` — RAGAS 评估（faithfulness / answer_relevancy / context_precision / context_recall）。逐条走真实检索链路 `retrieval._retrieve` 生成回答 → 判分；测试集（questions/ground_truths 列表）在 `docs/test.py`。**用独立 venv `.venv-ragas/` 运行**（ragas 0.4.3 要求 langchain-core 0.3.x，与主环境 1.5.3 冲突，绝不能装进主 venv）
+- `.ragas_cache.json` — 生成结果缓存（question → response + contexts），重跑复用、只重新判分；**改测试集题目/重新上传文档/调检索参数后必须删掉或加 RAGAS_NO_CACHE=1**，否则结果是旧库的
+- **`.venv-ragas/` 版本锁定**：pymilvus 2.5.18、langchain-milvus 0.1.10、langchain-core 1.5.3（ragas 装时会把 core 降到 0.3.86，必须 --force-reinstall 回 1.5.3）。评估脚本在模块级 `connections.connect(alias="default", uri=...)`（**必须用 uri 形式**，只传 host/port 会报 ConnLackConf）；指标用 `ragas.metrics` 单例（collections 里的类是 `SimpleBaseMetric` 体系，`evaluate` 的 `isinstance(m, Metric)` 校验不过）；判分 LLM 用 `ChatOpenAI` + 项目 `get_embeddings()`（llm_factory/embedding_factory 的现代实现不兼容旧指标）
 
 ### 前端 `frontend/`
 

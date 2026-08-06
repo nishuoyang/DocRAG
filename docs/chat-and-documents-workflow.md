@@ -1,6 +1,6 @@
 # Chat 与 Documents 工作流程详解
 
-> 适用版本：当前 main 分支（后端 FastAPI + 前端 Vue 3）。
+> 适用版本：当前 main 分支（后端 FastAPI + 前端 Vue 3 + RAGAS 评估）。
 > 阅读本文前建议先看根目录 `CLAUDE.md` 了解整体架构；本文深入每个接口的内部执行流程。
 
 ---
@@ -311,3 +311,68 @@ data: [DONE]
 | 上传的 chunk_type 是 None | 旧 collection（无该字段） | 重建 collection 后重新上传 |
 | 删除后列表没变 | 文件名含特殊字符导致表达式匹配失败 | 用 `GET /documents` 确认准确文件名 |
 | 上传报错 `文档处理失败` | 文件损坏/加密 PDF | 后端日志看具体异常栈 |
+
+---
+
+## 7. RAGAS 评估（离线效果评价）
+
+> 适用：对整套 RAG 链路（检索 + 生成）做量化评价，输出 faithfulness / answer_relevancy / context_precision / context_recall 四项指标。
+
+### 7.1 测试集
+
+`docs/test.py`（或 `RAGAS_TESTSET` 指定的文件）包含两个等长列表：
+
+- `questions` — 与资料库内容对应的问题
+- `ground_truths` — 每题的标准答案（列表包字符串）
+
+### 7.2 运行
+
+```bash
+cd backend && ./.venv-ragas/Scripts/python.exe -X utf8 scripts/eval_ragas.py
+```
+
+**必须用独立 venv `.venv-ragas/`**（ragas 0.4.3 会降级 langchain-core 到 0.3.x，与主环境 1.5.3 冲突，装进主 venv 会崩）。版本锁定：pymilvus 2.5.18、langchain-milvus 0.1.10、langchain-core 1.5.3。
+
+### 7.3 执行流程
+
+```
+questions/ground_truths（docs/test.py）
+        │
+        ▼
+① 逐条走真实检索链路 retrieval._retrieve(query, TOP_K=5)
+        │   （改写+HYDE → 向量+BM25 → rerank，与 /chat 完全一致）
+        ▼
+② LLM 生成回答（同一套 SYSTEM_PROMPT）
+        │
+        ▼
+③ 组 ragas 数据集：user_input / response / reference / retrieved_contexts
+        │
+        ▼
+④ 4 指标判分（Judge LLM = .env 的 DeepSeek，Embedding = SiliconFlow bge-m3）
+        │   faithfulness / answer_relevancy / context_precision / context_recall
+        ▼
+⑤ 输出逐条明细 + 聚合统计（mean/min/分位数）
+```
+
+**每步细节**：
+
+- **生成缓存**：①-② 结果按 question 存 `.ragas_cache.json`（response + contexts），重跑命中缓存、只重新判分（省 6-7 分钟）。**缓存键是 question 字符串**：新题自动生成并添加，同题覆盖。
+- **缓存失效**：改了测试集题目、重新上传/删除文档、或调了检索参数（TOP_K/分块/rerank）后，**必须 `RAGAS_NO_CACHE=1` 强制重新生成**，否则评估结果是旧库的。
+- **判分**：指标用 `ragas.metrics` 单例（`faithfulness` 等）；`ragas.metrics.collections` 里的类是 `SimpleBaseMetric` 体系，过不了 `evaluate` 的 `isinstance(m, Metric)` 校验，不能用。判分 LLM 用 `ChatOpenAI` + 项目 `get_embeddings()`（`llm_factory`/`embedding_factory` 的现代实现不兼容旧指标）。
+- **连接**：脚本模块级 `connections.connect(alias="default", uri="http://host:port")`（**必须 uri 形式**，只传 host/port 走环境变量分支报 ConnLackConf）。
+
+### 7.4 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `RAGAS_TESTSET` | `docs/test.py` | 测试集路径（相对项目根目录） |
+| `RAGAS_NO_CACHE=1` | 关 | 忽略缓存强制重新生成（换库/调参后必须） |
+| `RAGAS_CACHE` | `backend/.ragas_cache.json` | 缓存文件路径 |
+| `RAGAS_LLM_MODEL` / `RAGAS_LLM_BASE_URL` / `RAGAS_LLM_API_KEY` | 复用 .env LLM | 单独指定判分模型 |
+
+### 7.5 已知局限
+
+- 判分 LLM 偶发输出截断（`IncompleteOutputException`）→ 该题指标为 NaN，重跑即可
+- 检索失败（返回默认"未检索到"文案）时 answer_relevancy=0，属真实信号（如 #3 api_base 题）
+- 50 题全量约 12 分钟（生成 7 分钟 + 判分 5 分钟），命中缓存后仅判分 ~6 分钟
+
