@@ -23,8 +23,12 @@ volumes/
 
 # 前端
 frontend/node_modules/
+<<<<<<<<< Temporary merge branch 1
 frontend/dist/
 
-.docs/
+docs/
 
-.CLAUDE.md
+CLAUDE.md
+=========
+frontend/dist/
+>>>>>>>>> Temporary merge branch 2
