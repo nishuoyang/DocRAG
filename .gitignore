@@ -23,12 +23,13 @@ volumes/
 
 # 前端
 frontend/node_modules/
-<<<<<<<<< Temporary merge branch 1
 frontend/dist/
 
+# 文档与评估报告
 docs/
+reports/
 
-CLAUDE.md
-=========
-frontend/dist/
->>>>>>>>> Temporary merge branch 2
+# RAGAS 运行时缓存（生成结果/知识图谱/personas）
+backend/.ragas_cache.json
+backend/.ragas_kg_cache.json
+backend/.ragas_personas.json

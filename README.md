@@ -15,7 +15,7 @@
 | 🧩 **双分块策略** | 短文档语义切分（句子 embedding 相似度断块）、长文档固定切分，`chunk_type` 标记共存 |
 | 💬 **流式问答** | SSE 逐字输出 + 打字机渲染 + 思考动画 + 引用来源卡片 |
 | 🧠 **对话记忆** | SQLite 持久化，刷新页面/重启服务对话自动续上 |
-| 📊 **离线评估** | 内置 RAGAS 评估脚本，4 项指标量化检索与生成质量 |
+| 📊 **离线评估** | RAGAS 自动化：测试集自动生成（中文）+ 4 项指标量化 + Markdown/JSON 报告 |
 
 ---
 
@@ -116,11 +116,16 @@ npm run dev                 # http://localhost:5173（用 localhost 而非 127.0
 
 ## 📊 RAGAS 评估
 
+### 评估
+
 ```bash
 cd backend
 ./.venv-ragas/Scripts/python.exe -X utf8 scripts/eval_ragas.py
-# RAGAS_TESTSET=docs/test2.py   换测试集
-# RAGAS_NO_CACHE=1              换文档库/检索参数后强制重新生成
+# --testset docs/test.py   换测试集（默认 docs/test.py）
+# --top-k 5                检索返回块数
+# --no-transform / --no-hyde / --no-rerank   关闭对应检索开关（不改 .env）
+# --no-cache               换文档库/检索参数后强制重新生成
+# --report-dir reports/    报告目录（自动创建，产出带时间戳的 Markdown + JSON）
 ```
 
 - 测试集：`docs/test.py`（questions + ground_truths 两列表）
@@ -128,14 +133,39 @@ cd backend
 - 真实链路：逐条走 `_retrieve`（与线上 /chat 完全一致）→ 生成 → 判分
 - 独立 venv `.venv-ragas/`（ragas 0.4.3 与主环境依赖冲突，绝不装进主 venv）
 
-**最近一次全量结果（49 题）**：
+### 自动生成测试集
+
+```bash
+cd backend
+./.venv-ragas/Scripts/python.exe -X utf8 scripts/generate_testset.py --size 20 --max-chunks 100
+# --strategy single-hop   生成策略（默认 single-hop；multi-hop 需图谱建边更慢）
+# --lang zh               测试集语言（默认 zh 中文，匹配中文文档库）
+# --style clean           排除错别字风格问题（POOR_GRAMMAR / MISSPELLED）
+# --workers 32            并发 LLM 调用数（遇 API 限流调低）
+```
+
+- 从 Milvus 文档库自动合成 questions + 参考答案，输出到 `docs/test_generated.py`（与 test.py 同格式，可直接给评估脚本用）
+- 知识图谱与 personas 缓存（`.ragas_kg_cache.json` / `.ragas_personas.json`），重跑复用跳过抽取阶段
+- 中文问题支持：覆盖合成器 prompt 指令（ragas 默认英文，中文库下 context_recall 会偏低）
+- `.env` 可配 `RAGAS_FAST_LLM_MODEL`（+ 独立 BASE_URL / API_KEY）给抽取阶段指定快模型
+
+### 查看块内容
+
+```bash
+cd backend
+./.venv/Scripts/python.exe scripts/inspect_chunks.py --index 3,7,12 --full
+```
+
+- 排查检索问题 / 检查分块质量用；主环境 venv 即可
+
+**最近一次评估结果（20 题，自动生成测试集）**：
 
 | 指标 | 平均分 | 中位数 |
 |---|---|---|
-| Faithfulness 忠实度 | 0.955 | 1.00 |
-| Answer Relevancy 相关性 | 0.880 | 0.92 |
-| Context Precision 精度 | 0.895 | 1.00 |
-| Context Recall 召回 | 0.850 | 1.00 |
+| Faithfulness 忠实度 | 0.915 | 1.00 |
+| Answer Relevancy 相关性 | 0.785 | 0.81 |
+| Context Precision 精度 | 0.830 | 0.92 |
+| Context Recall 召回 | 0.950 | 1.00 |
 
 ---
 
@@ -147,10 +177,12 @@ backend/                  FastAPI 后端
 ├── core/                 业务层：ingestion（解析分块）/ retrieval（检索+RAG）
 │                         / query_transform（改写+HYDE）/ bm25 / rerank / llm / embeddings
 ├── db/                   milvus.py（向量库）/ memory.py（SQLite 对话记忆）
-├── scripts/              eval_ragas.py（RAGAS 评估）
+├── scripts/              eval_ragas.py（RAGAS 评估）/ generate_testset.py（测试集生成）
+│                         / inspect_chunks.py（块内容查看）
 └── config.py             pydantic-settings 配置（.env）
 frontend/                 Vue 3 前端（ChatPanel 流式对话 / DocManager 文档管理 / SourceCard 来源）
-docs/                     工作流程详解、测试集
+docs/                     工作流程详解、测试集、踩坑记录
+reports/                  评估报告（Markdown + JSON，gitignore 忽略）
 docker-compose.yml        Milvus + etcd + MinIO
 ```
 
@@ -159,6 +191,7 @@ docker-compose.yml        Milvus + etcd + MinIO
 ## 📚 文档
 
 - [docs/chat-and-documents-workflow.md](docs/chat-and-documents-workflow.md) — 每个接口的内部执行流程（12 步检索链路、SSE 事件流、排查表）
+- [docs/ragas-testset-issues.md](docs/ragas-testset-issues.md) — ragas TestsetGenerator 接入排坑记录（事件循环修复、空块过滤）
 - [CLAUDE.md](CLAUDE.md) — 给 Claude Code 的项目指南（架构 + 已知问题 + 常用命令）
 
 ---

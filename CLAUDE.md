@@ -31,12 +31,28 @@ cd frontend && npm run build
 
 # RAGAS 评估（独立 venv，不污染主环境；生成结果缓存在 backend/.ragas_cache.json）
 cd backend && ./.venv-ragas/Scripts/python.exe -X utf8 scripts/eval_ragas.py
-#   RAGAS_TESTSET=docs/test2.py   换测试集（默认 docs/test.py）
-#   RAGAS_NO_CACHE=1              换文档库/检索参数后必须加（强制重新走检索链路）
-#   RAGAS_CACHE=<path>            改缓存路径
+#   --testset docs/test.py     换测试集（默认 docs/test.py；RAGAS_TESTSET 同效）
+#   --top-k 5                  检索返回块数（默认读 .env TOP_K）
+#   --no-transform/--no-hyde/--no-rerank   关闭对应检索开关（运行时覆盖，不改 .env）
+#   --no-cache                 忽略缓存强制重新生成（换文档库/检索参数后必须）
+#   --report-dir reports/      报告目录（默认 reports/，自动创建；产出 md + json 带时间戳）
+
+# RAGAS 测试集自动生成（从 Milvus 文档库合成 questions/ground_truths）
+cd backend && ./.venv-ragas/Scripts/python.exe -X utf8 scripts/generate_testset.py
+#   --size 20                  题目数（默认 20）
+#   --strategy single-hop      生成策略：single-hop（默认，最快）/ multi-hop / full
+#   --lang zh                  测试集语言（默认 zh 中文；ragas 默认英文会让 context_recall 偏低）
+#   --max-chunks 100           抽样块数上限（大库建议 100-200，抽取耗时与块数成正比）
+#   --workers 32               并发 LLM 调用数（默认 32；遇 API 限流调低）
+#   --style clean              排除 POOR_GRAMMAR/MISSPELLED 错别字风格（仅保留规范问题）
+#   --no-cache                 忽略知识图谱/personas 缓存强制重新抽取
+
+# 查看 Milvus 文档库块内容（主环境 venv 即可，零成本）
+cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
+#   --index 3,7,12  按块索引查看   --file 关键词   --query 内容关键词   --full 完整内容
 ```
 
-环境配置从 `.env` 读取（参考 `backend/.env.example`，含 Milvus 地址、LLM/Embedding 的 API Key、模型名、分块参数）。API Key 不提交进 git。
+环境配置从 `.env` 读取（参考 `backend/.env.example`，含 Milvus 地址、LLM/Embedding 的 API Key、模型名、分块参数）。API Key 不提交进 git。`.env` 另有 RAGAS 测试集生成专用变量（见下）。
 
 ## 架构
 
@@ -66,9 +82,21 @@ cd backend && ./.venv-ragas/Scripts/python.exe -X utf8 scripts/eval_ragas.py
 
 ### 评估 `backend/scripts/`
 
-- `eval_ragas.py` — RAGAS 评估（faithfulness / answer_relevancy / context_precision / context_recall）。逐条走真实检索链路 `retrieval._retrieve` 生成回答 → 判分；测试集（questions/ground_truths 列表）在 `docs/test.py`。**用独立 venv `.venv-ragas/` 运行**（ragas 0.4.3 要求 langchain-core 0.3.x，与主环境 1.5.3 冲突，绝不能装进主 venv）
-- `.ragas_cache.json` — 生成结果缓存（question → response + contexts），重跑复用、只重新判分；**改测试集题目/重新上传文档/调检索参数后必须删掉或加 RAGAS_NO_CACHE=1**，否则结果是旧库的
-- **`.venv-ragas/` 版本锁定**：pymilvus 2.5.18、langchain-milvus 0.1.10、langchain-core 1.5.3（ragas 装时会把 core 降到 0.3.86，必须 --force-reinstall 回 1.5.3）。评估脚本在模块级 `connections.connect(alias="default", uri=...)`（**必须用 uri 形式**，只传 host/port 会报 ConnLackConf）；指标用 `ragas.metrics` 单例（collections 里的类是 `SimpleBaseMetric` 体系，`evaluate` 的 `isinstance(m, Metric)` 校验不过）；判分 LLM 用 `ChatOpenAI` + 项目 `get_embeddings()`（llm_factory/embedding_factory 的现代实现不兼容旧指标）
+- `eval_ragas.py` — RAGAS 评估（faithfulness / answer_relevancy / context_precision / context_recall）。逐条走真实检索链路 `retrieval._retrieve` 生成回答 → 判分；测试集（questions/ground_truths 列表）在 `docs/test.py`。参数化 CLI：`--testset` / `--top-k` / `--no-transform` / `--no-hyde` / `--no-rerank` / `--no-cache` / `--report-dir`；检索开关靠运行时覆盖 `get_settings()` 单例（pydantic 字段可赋值，进程级生效、不影响 .env）。输出带时间戳的 Markdown + JSON 报告到 `reports/`（gitignore）。**用独立 venv `.venv-ragas/` 运行**（ragas 0.4.3 要求 langchain-core 0.3.x，与主环境 1.5.3 冲突，绝不能装进主 venv）
+- `generate_testset.py` — 用 ragas `TestsetGenerator` 从 Milvus 文档库自动合成测试集（questions + 参考答案）。transforms 构建知识图谱（Summary/NER 抽取）→ 合成问题。图谱缓存 `.ragas_kg_cache.json` + personas 缓存 `.ragas_personas.json`（重跑复用，跳过抽取阶段）。中文支持：覆盖合成器 prompt 的 instruction 类属性（不覆盖则生成英文问题，中文库下 context_recall 偏低）。`--style clean` 通过子类化合成器排除错别字风格。**坑**：脚本入口必须 `nest_asyncio.apply()`（ragas 多次 `asyncio.run()` 关闭循环导致 openai client 报 `Event loop is closed`，含 pymilvus 导入时更易触发）；`load_documents()` 过滤空块（ragas 抽取器对空块 `IndexError`）；`default_query_distribution` 传自定义分布时必须带 knowledge_graph 过滤多跳合成器
+- `inspect_chunks.py` — 查看 Milvus 块内容（索引/文件名/关键词筛选），排查检索问题、检查分块质量用。**主环境 venv 即可**（只依赖 milvus 读取）
+- `.ragas_cache.json` — 生成结果缓存（question → response + contexts），重跑复用、只重新判分；**改测试集题目/重新上传文档/调检索参数后必须删掉或加 --no-cache**，否则结果是旧库的
+- **`.venv-ragas/` 版本锁定**：pymilvus 2.5.18、langchain-milvus 0.1.10、langchain-core 1.5.3（ragas 装时会把 core 降到 0.3.86，必须 --force-reinstall 回 1.5.3）。另需 `pip install rapidfuzz`（0.4.3 的 `OverlapScoreBuilder` 依赖，默认没装）。评估脚本在模块级 `connections.connect(alias="default", uri=...)`（**必须用 uri 形式**，只传 host/port 会报 ConnLackConf）；指标用 `ragas.metrics` 单例（collections 里的类是 `SimpleBaseMetric` 体系，`evaluate` 的 `isinstance(m, Metric)` 校验不过）；判分 LLM 用 `ChatOpenAI` + 项目 `get_embeddings()`（llm_factory/embedding_factory 的现代实现不兼容旧指标）
+
+### RAGAS 环境变量（.env）
+
+| 变量 | 作用 | 未设置时 |
+|---|---|---|
+| `RAGAS_FAST_LLM_MODEL` | transforms（Summary/NER 抽取）用的快模型 | 回落 `LLM_MODEL` |
+| `RAGAS_FAST_LLM_BASE_URL` / `RAGAS_FAST_LLM_API_KEY` | 快模型的独立端点/凭据（如硅基流动） | 回落主 LLM 配置 |
+| `RAGAS_LLM_MODEL` / `RAGAS_LLM_BASE_URL` / `RAGAS_LLM_API_KEY` | 评估/合成判分 LLM 覆盖 | 回落 .env 主配置 |
+| `RAGAS_TESTSET` / `RAGAS_CACHE` / `RAGAS_NO_CACHE` | eval 脚本兼容变量 | — |
+| `RAGAS_KG_CACHE` / `RAGAS_PERSONAS_CACHE` | 图谱/personas 缓存路径 | `backend/.ragas_*.json` |
 
 ### 前端 `frontend/`
 
@@ -90,3 +118,5 @@ cd backend && ./.venv-ragas/Scripts/python.exe -X utf8 scripts/eval_ragas.py
 - `get_settings()` 有 lru_cache：改 .env 不热生效，重启进程
 - 对话历史在 SQLite（`backend/chat_memory.db`，gitignore 忽略），刷新页面自动恢复
 - 语义切分对每句调一次 embedding API（计费 + 耗时），auto 模式只对 <3000 字符短文档启用
+- 根 `.gitignore` 忽略 `reports/`（评估报告）与 `docs/` 下的测试集文件（`docs/test.py` 等已 tracked 的除外）
+- ragas TestsetGenerator 0.4.3 的 API 限制与踩坑详见 [docs/ragas-testset-issues.md](docs/ragas-testset-issues.md)
