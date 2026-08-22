@@ -1,7 +1,7 @@
 # 📚 DocRAG · 垂直领域智能文档问答系统
 
 > 上传你的 PDF / DOCX / PPT / Excel… 问它任何问题，回答带引用来源。
-> 一套完整的 RAG 工程实践：**语义切分 → 混合检索 → Query 增强 → Rerank → 流式问答**。
+> 一套完整的 RAG 工程实践：**结构化解析 → Markdown 分块 → 混合检索 → Query 增强 → Rerank → 流式问答**。
 
 ---
 
@@ -9,22 +9,26 @@
 
 | | |
 |---|---|
-| 🧠 **混合检索** | 向量（语义）+ BM25（关键词）双路召回，专有名词/代码片段不漏 |
+|  **混合检索** | 向量（语义）+ BM25（关键词）双路召回，专有名词/代码片段不漏 |
 | 🔍 **Query 增强** | LLM 改写补指代 + HYDE 假想答案，并行调用，失败自动降级 |
 | 🎯 **Rerank 精排** | bge-reranker-v2-m3 交叉编码，用**原始 query** 贴合用户意图 |
-| 🧩 **双分块策略** | 短文档语义切分（句子 embedding 相似度断块）、长文档固定切分，`chunk_type` 标记共存 |
+| 📄 **结构化解析** | PDF/DOCX 表格转 Markdown、标题层级识别、扫描件 OCR |
+|  **Markdown 分块** | 按章节切分、表格保护、每块带章节上下文 |
+| 🖼️ **多模态理解** | VLM 描述内嵌图片、扫描件页面读图（硅基流动 Qwen2.5-VL） |
+| ⚡ **异步上传** | 后台任务处理 + 实时进度查询 |
 | 💬 **流式问答** | SSE 逐字输出 + 打字机渲染 + 思考动画 + 引用来源卡片 |
 | 🧠 **对话记忆** | SQLite 持久化，刷新页面/重启服务对话自动续上 |
 | 📊 **离线评估** | RAGAS 自动化：测试集自动生成（中文）+ 4 项指标量化 + Markdown/JSON 报告 |
 
 ---
 
-## 🏗️ 技术栈
+## ️ 技术栈
 
 ```
 Frontend: Vue 3 + Vite + Tailwind CSS v4（打字机式 SSE 渲染）
 Backend : FastAPI + LangChain（langchain-milvus / ChatOpenAI）
 VectorDB: Milvus（Docker Compose，etcd + MinIO）
+Parsing : pymupdf4llm（PDF 表格）+ python-docx（DOCX 结构）+ VLM（多模态）
 Retrieval: 向量 + BM25（rank_bm25 + jieba）→ 多查询合并去重 → Rerank
 LLM/Embedding/Rerank: DeepSeek 官方 + 硅基流动 SiliconFlow（OpenAI 兼容云 API）
 Eval    : RAGAS（faithfulness / answer_relevancy / context_precision / context_recall）
@@ -32,7 +36,7 @@ Eval    : RAGAS（faithfulness / answer_relevancy / context_precision / context_
 
 ---
 
-## 🚀 快速开始
+##  快速开始
 
 ### 0. 前置条件
 
@@ -51,6 +55,7 @@ docker compose up -d        # Milvus + etcd + MinIO
 ```bash
 cp backend/.env.example backend/.env
 # 填入 LLM_API_KEY（DeepSeek）、EMBEDDING_API_KEY / RERANK_API_KEY（硅基流动）
+# 可选：VLM_API_KEY（硅基流动，用于扫描件 OCR 和图片描述）
 ```
 
 ### 3. 启动后端
@@ -58,7 +63,7 @@ cp backend/.env.example backend/.env
 ```bash
 cd backend
 poetry install
-./.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
+./.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001
 ```
 
 ### 4. 启动前端
@@ -74,7 +79,7 @@ npm run dev                 # http://localhost:5173（用 localhost 而非 127.0
 ### 5. 开始使用
 
 1. **文档管理** → 拖拽上传（支持 PDF / DOCX / TXT / MD / CSV / XLSX / PPTX / HTML，最大 20MB）
-2. 选择切分策略：**自动**（短文档语义、长文档固定）/ 语义 / 固定
+2. 选择切分策略：**自动**（PDF/DOCX 结构分块、短文档语义、长文档固定）/ 结构分块 / 语义 / 固定
 3. **聊天** → 提问，看流式回答 + 引用来源；拖 Top-K 滑块控制检索数量
 
 ---
@@ -85,10 +90,10 @@ npm run dev                 # http://localhost:5173（用 localhost 而非 127.0
 用户提问
    │
    ▼
-┌──────────────┐   ┌──────────────┐
+┌──────────────┐   ┌──────────────
 │ Query 改写    │   │ HYDE 假想答案 │   ← 并行 LLM 调用，失败降级原 query
-└──────┬───────┘   └──────┬───────┘
-       └────────┬─────────┘
+└─────────────┘   └─────────────┘
+       └─────────────────┘
                 ▼
     多查询分别检索（向量 Top-10 + BM25 Top-10）
                 │  按文本内容合并去重
@@ -96,7 +101,7 @@ npm run dev                 # http://localhost:5173（用 localhost 而非 127.0
         Rerank 精排（原始 query，bge-reranker-v2-m3）
                 │
                 ▼
-   system(参考资料) + history(最近6轮) + query → LLM 流式生成
+   system(参考资料) + history(最近 6 轮) + query → LLM 流式生成
                 │
                 ▼
    SSE 逐字输出 + 来源引用 → 写入 SQLite 记忆
@@ -110,7 +115,7 @@ npm run dev                 # http://localhost:5173（用 localhost 而非 127.0
 | 向量 + BM25 混合 | 语义相似但无关键词、或关键词精确但语义跑偏 → 互补 |
 | Rerank 用原始 query | 改写/假文档只用于召回，最终排序贴合用户本意 |
 | 记忆存 50 轮取 6 轮 | 刷新恢复对话，又不稀释检索上下文 |
-| 语义/固定分块共存 | 短文档语义切分更精准，长文档固定切分省钱 |
+| Markdown 结构分块 | 按章节切分更精准，表格不切断，每块带章节上下文 |
 
 ---
 
@@ -173,12 +178,23 @@ cd backend
 
 ```
 backend/                  FastAPI 后端
-├── api/                  路由层（documents / chat，7 个 endpoint，无业务逻辑）
-├── core/                 业务层：ingestion（解析分块）/ retrieval（检索+RAG）
-│                         / query_transform（改写+HYDE）/ bm25 / rerank / llm / embeddings
+├── api/                  路由层（documents / chat，8 个 endpoint）
+├── core/                 业务层
+│   ├── parsers/          v2 结构化解析器（pdf/docx/pptx）
+│   ├── cleaning.py       噪声清洗（页眉页脚剔除）
+│   ├── md_split.py       Markdown 结构感知分块
+│   ├── vlm.py            VLM 多模态客户端
+│   ├── jobs.py           后台任务管理
+│   ├── ingestion.py      文档摄入（解析→清洗→分块→去重→入库）
+│   ├── retrieval.py      检索+RAG 生成
+│   ├── query_transform.py 改写+HYDE
+│   ├── bm25.py           BM25 关键词检索
+│   ├── rerank.py         Rerank 精排
+│   ├── llm.py            LLM 工厂
+│   └── embeddings.py     Embedding 工厂
 ├── db/                   milvus.py（向量库）/ memory.py（SQLite 对话记忆）
-├── scripts/              eval_ragas.py（RAGAS 评估）/ generate_testset.py（测试集生成）
-│                         / inspect_chunks.py（块内容查看）
+── scripts/              eval_ragas.py / generate_testset.py / inspect_chunks.py / rebuild_collection.py
+├── uploads/              上传原件落盘（支持重解析）
 └── config.py             pydantic-settings 配置（.env）
 frontend/                 Vue 3 前端（ChatPanel 流式对话 / DocManager 文档管理 / SourceCard 来源）
 docs/                     工作流程详解、测试集、踩坑记录
@@ -200,9 +216,9 @@ docker-compose.yml        Milvus + etcd + MinIO
 
 - **pymilvus 锁定 `>=2.5.5,<2.6.0`**：2.6.x 与 langchain-milvus 不兼容
 - **Collection schema 建库时定死**：加 metadata 字段需重建（数据丢失），换 Embedding 模型同理
-- 同文件重复上传会重复入库（无去重）
 - 上传失败无事务回滚（可能残留部分向量）
 - 改 `.env` 不热生效（`get_settings()` lru_cache），需重启后端
+- VLM 处理页数有限制（默认 30 页），超大文档可能跳过部分页面
 
 ---
 

@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { listDocuments, uploadDocument, deleteDocument } from '../api'
+import { listDocuments, uploadDocument, deleteDocument, getJobStatus } from '../api'
 
 const docs = ref([])
 const loading = ref(false)
@@ -8,12 +8,15 @@ const uploading = ref(false)
 const message = ref('')
 const dragOver = ref(false)
 const fileInput = ref(null)
+const progress = ref(0)
+const progressMessage = ref('')
 
 const ALLOWED = ['pdf', 'docx', 'txt', 'md', 'csv', 'xlsx', 'pptx']
-// 切分策略：auto 自动（短文档语义、长文档固定）| semantic | fixed
+// 切分策略：auto 自动（PDF/DOCX 结构分块、短文档语义、长文档固定）| markdown | semantic | fixed
 const splitMode = ref('auto')
 const SPLIT_OPTIONS = [
-  { value: 'auto', label: '自动（短文档语义 / 长文档固定）' },
+  { value: 'auto', label: '自动（结构分块 / 语义 / 固定）' },
+  { value: 'markdown', label: '结构分块（标题层级 + 表格保护）' },
   { value: 'semantic', label: '语义切分（按话题断块）' },
   { value: 'fixed', label: '固定长度切分（500 字符）' },
 ]
@@ -35,7 +38,34 @@ function formatTime(ts) {
   return new Date(ts * 1000).toLocaleString('zh-CN')
 }
 
-async function doUpload(file) {
+async function pollJobStatus(jobId) {
+  const maxAttempts = 300 // 最多轮询 5 分钟（300 * 1秒）
+  let attempts = 0
+  
+  while (attempts < maxAttempts) {
+    try {
+      const job = await getJobStatus(jobId)
+      progress.value = job.progress
+      progressMessage.value = job.message
+      
+      if (job.status === 'completed') {
+        return job
+      } else if (job.status === 'failed') {
+        throw new Error(job.error || job.message)
+      }
+      
+      // 等待 1 秒后继续轮询
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      attempts++
+    } catch (e) {
+      throw e
+    }
+  }
+  
+  throw new Error('任务超时')
+}
+
+async function doUpload(file, replace = false) {
   const ext = file.name.toLowerCase().split('.').pop()
   if (!ALLOWED.includes(ext)) {
     message.value = `仅支持 ${ALLOWED.join(' / ').toUpperCase()} 文件`
@@ -43,15 +73,38 @@ async function doUpload(file) {
   }
   uploading.value = true
   message.value = ''
+  progress.value = 0
+  progressMessage.value = '正在上传...'
+  
   try {
-    const res = await uploadDocument(file, splitMode.value)
-    const label = SPLIT_OPTIONS.find((o) => o.value === res.chunk_type)?.label ?? res.chunk_type
-    message.value = `上传成功：${res.filename}（${res.chunk_count} 个分块，${label}）`
+    // 1. 提交上传任务
+    const job = await uploadDocument(file, splitMode.value, replace)
+    const jobId = job.job_id
+    
+    // 2. 轮询任务状态
+    const result = await pollJobStatus(jobId)
+    
+    // 3. 显示成功消息
+    const chunkType = result.result?.chunk_type
+    const label = SPLIT_OPTIONS.find((o) => o.value === chunkType)?.label ?? chunkType
+    message.value = `上传成功：${file.name}（${result.result?.chunk_count || 0} 个分块，${label}）`
+    
+    // 4. 刷新文档列表
     await refresh()
   } catch (e) {
+    // 检测到重复文件时，提示用户是否覆盖
+    if (e.message.includes('已入库') && !replace) {
+      if (confirm(`文件「${file.name}」已入库。是否覆盖旧版本重新上传？`)) {
+        uploading.value = false
+        await doUpload(file, true)
+        return
+      }
+    }
     message.value = `上传失败: ${e.message}`
   } finally {
     uploading.value = false
+    progress.value = 0
+    progressMessage.value = ''
   }
 }
 
@@ -91,27 +144,47 @@ onMounted(refresh)
 
     <!-- 上传区 -->
     <div
-      class="border-2 border-dashed rounded-xl p-10 text-center transition-colors cursor-pointer"
-      :class="dragOver ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-gray-400'"
+      class="border-2 border-dashed rounded-xl p-10 text-center transition-colors"
+      :class="[
+        dragOver ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-gray-400',
+        uploading ? 'cursor-not-allowed' : 'cursor-pointer'
+      ]"
       @dragover.prevent="dragOver = true"
       @dragleave="dragOver = false"
       @drop.prevent="onDrop"
-      @click="fileInput.click()"
+      @click="!uploading && fileInput.click()"
     >
-      <input ref="fileInput" type="file" accept=".pdf,.docx,.txt,.md,.csv,.xlsx,.pptx" class="hidden" @change="onFileChange" />
-      <div class="text-4xl mb-2">{{ uploading ? '⏳' : '📤' }}</div>
-      <p class="text-gray-600">{{ uploading ? '正在解析并入库...' : '点击或拖拽文件到此处上传' }}</p>
-      <p class="mt-1 text-xs text-gray-400">支持 PDF / DOCX / TXT / MD / CSV / XLSX / PPTX，单文件不超过 20MB</p>
-      <div class="mt-3 inline-flex items-center gap-2">
-        <span class="text-xs text-gray-500">切分策略</span>
-        <select
-          v-model="splitMode"
-          class="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white text-gray-700 focus:outline-none focus:border-blue-400"
-          @click.stop
-        >
-          <option v-for="o in SPLIT_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
-        </select>
-      </div>
+      <input ref="fileInput" type="file" accept=".pdf,.docx,.txt,.md,.csv,.xlsx,.pptx" class="hidden" @change="onFileChange" :disabled="uploading" />
+      
+      <template v-if="uploading">
+        <div class="text-4xl mb-2">⏳</div>
+        <p class="text-gray-600 mb-3">{{ progressMessage }}</p>
+        <div class="w-full max-w-md mx-auto">
+          <div class="bg-gray-200 rounded-full h-2 overflow-hidden">
+            <div 
+              class="bg-blue-500 h-full transition-all duration-300"
+              :style="{ width: `${progress}%` }"
+            ></div>
+          </div>
+          <p class="text-xs text-gray-500 mt-2">{{ progress }}%</p>
+        </div>
+      </template>
+      
+      <template v-else>
+        <div class="text-4xl mb-2">📤</div>
+        <p class="text-gray-600">点击或拖拽文件到此处上传</p>
+        <p class="mt-1 text-xs text-gray-400">支持 PDF / DOCX / TXT / MD / CSV / XLSX / PPTX，单文件不超过 20MB</p>
+        <div class="mt-3 inline-flex items-center gap-2">
+          <span class="text-xs text-gray-500">切分策略</span>
+          <select
+            v-model="splitMode"
+            class="text-xs border border-gray-300 rounded-lg px-2 py-1 bg-white text-gray-700 focus:outline-none focus:border-blue-400"
+            @click.stop
+          >
+            <option v-for="o in SPLIT_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+          </select>
+        </div>
+      </template>
     </div>
 
     <!-- 文档列表 -->

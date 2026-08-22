@@ -54,8 +54,8 @@ fi
 
 # 2. 后端 FastAPI
 check "$BACKEND/.venv/Scripts/python.exe"
-info "启动后端 FastAPI (http://127.0.0.1:8000)..."
-(cd "$BACKEND" && ./.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000) &
+info "启动后端 FastAPI (http://127.0.0.1:8001)..."
+(cd "$BACKEND" && ./.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8001) &
 BACKEND_PID=$!
 
 # 3. 前端 Vite
@@ -73,10 +73,10 @@ fi
 trap 'kill $BACKEND_PID ${FRONTEND_PID:-0} 2>/dev/null || true' INT TERM
 
 # 等后端就绪后提示访问地址
-wait_health "http://127.0.0.1:8000/health" "后端 FastAPI" 60 || true
+wait_health "http://127.0.0.1:8001/health" "后端 FastAPI" 60 || true
 
 printf "\n${GREEN}=== 服务已启动 ===${NC}\n"
-printf "  后端 API:   http://127.0.0.1:8000 (Swagger: /docs)\n"
+printf "  后端 API:   http://127.0.0.1:8001 (Swagger: /docs)\n"
 if [ "$BACKEND_ONLY" = false ]; then
   printf "  前端页面:   http://localhost:5173\n"
 fi

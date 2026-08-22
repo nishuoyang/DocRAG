@@ -1,4 +1,11 @@
-"""文档摄入：解析文件 → 分块 → 写入 Milvus。"""
+"""文档摄入：解析文件 → 分块 → 写入 Milvus。
+
+双引擎：
+- v2（默认）：core.parsers 结构化解析（PDF/DOCX 输出 Markdown）→ 噪声清洗
+  → core.md_split 结构感知分块（表格保护 + 章节元数据）
+- legacy：旧链路（PyPDFLoader/Docx2txtLoader + fixed/semantic），PARSER_ENGINE=legacy 回滚
+"""
+import hashlib
 import logging
 import os
 import re
@@ -7,7 +14,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from langchain_community.document_loaders import (
     BSHTMLLoader,
     CSVLoader,
@@ -21,10 +27,12 @@ from pptx import Presentation
 
 from config import get_settings
 from core.embeddings import get_embeddings
+from core.vlm import get_vlm_client
 from db import milvus
 
 logger = logging.getLogger(__name__)
 
+# legacy 引擎支持的扩展名（含自写 xlsx/pptx loader）
 SUPPORTED_EXTENSIONS = {
     ".pdf": PyPDFLoader,
     ".docx": Docx2txtLoader,
@@ -34,9 +42,26 @@ SUPPORTED_EXTENSIONS = {
     ".html": BSHTMLLoader,
 }
 
+# v2 引擎中可走 Markdown 结构分块的类型（解析器输出带标题层级/表格）
+_MARKDOWN_CAPABLE = {".pdf", ".docx"}
+
+
+class DuplicateFileError(ValueError):
+    """上传的文件（按内容哈希）已入库。"""
+
+    def __init__(self, filename: str, file_hash: str):
+        self.filename = filename
+        self.file_hash = file_hash
+        super().__init__(f"文件 {filename} 已入库（内容哈希 {file_hash[:12]}…）")
+
+
+# ───────────────────────── legacy 解析（回滚链路）─────────────────────────
+
 
 def _load_xlsx(file_path: str) -> list[Document]:
     """读取 xlsx 全部 sheet，每行文本拼为一个 Document。"""
+    import pandas as pd
+
     xls = pd.read_excel(file_path, sheet_name=None, dtype=str)
     docs: list[Document] = []
     for sheet_name, df in xls.items():
@@ -91,8 +116,23 @@ def _get_loader(file_path: str):
     return lambda p: loader_cls(p, **kwargs).load()
 
 
-def _make_metadata_docs(docs: list[Document], filename: str, chunk_type: str = "fixed") -> list[Document]:
-    """为每个文档块补充文件名、上传时间、块序号、切分类型元数据。"""
+def _legacy_load_documents(file_path: str) -> list[Document]:
+    return _get_loader(file_path)(file_path)
+
+
+# ───────────────────────── 分块（fixed / semantic / markdown）─────────────────────────
+
+
+def _make_metadata_docs(
+    docs: list[Document],
+    filename: str,
+    chunk_type: str = "fixed",
+    file_hash: str | None = None,
+) -> list[Document]:
+    """为每个文档块补充文件名、上传时间、块序号、切分类型等元数据。
+
+    markdown 分块产出的块自带 section / content_type，原样保留。
+    """
     timestamp = int(time.time())
     enriched: list[Document] = []
     for idx, doc in enumerate(docs):
@@ -105,24 +145,29 @@ def _make_metadata_docs(docs: list[Document], filename: str, chunk_type: str = "
         page = doc.metadata.get("page")
         if page is not None:
             metadata["page"] = page
-        enriched.append(
-            Document(
-                page_content=doc.page_content,
-                metadata=metadata,
-            )
-        )
+        section = doc.metadata.get("section")
+        if section:
+            metadata["section"] = section
+        content_type = doc.metadata.get("content_type")
+        if content_type:
+            metadata["content_type"] = content_type
+        if file_hash:
+            metadata["file_hash"] = file_hash
+        enriched.append(Document(page_content=doc.page_content, metadata=metadata))
     return enriched
 
 
-def _load_documents(file_path: str) -> list[Document]:
-    return _get_loader(file_path)(file_path)
-
-
 def _resolve_split_mode(docs: list[Document], split_mode: str | None) -> str:
-    """确定切分策略：手动指定优先；否则按配置（auto 时短文档语义、长文档固定）。"""
+    """确定切分策略：手动指定优先；否则按配置（auto 时短文档语义、长文档固定）。
+
+    markdown 模式：仅当解析引擎为 v2 且文件可输出结构化 Markdown 时生效，
+    否则降级为 auto 逻辑。
+    """
+    settings = get_settings()
+    if split_mode == "markdown":
+        return split_mode
     if split_mode in ("semantic", "fixed"):
         return split_mode
-    settings = get_settings()
     mode = str(settings.SEMANTIC_SPLIT).lower()
     if mode == "auto":
         total_len = sum(len(d.page_content) for d in docs)
@@ -134,6 +179,10 @@ def _resolve_split_mode(docs: list[Document], split_mode: str | None) -> str:
 def _split_documents(docs: list[Document], split_mode: str | None = None) -> tuple[list[Document], str]:
     """切分文档，返回 (切分结果, 实际使用的策略)。"""
     mode = _resolve_split_mode(docs, split_mode)
+    if mode == "markdown":
+        from core.md_split import split_markdown_documents
+
+        return split_markdown_documents(docs), "markdown"
     if mode == "semantic":
         return _semantic_split_documents(docs), "semantic"
     settings = get_settings()
@@ -205,26 +254,91 @@ def _semantic_split_documents(docs: list[Document]) -> list[Document]:
     return result
 
 
-def ingest_file(filename: str, content: bytes, split_mode: str | None = None) -> dict:
-    """解析上传文件并写入向量库，返回摄入统计。split_mode: semantic | fixed | None(自动)。"""
+# ───────────────────────── 上传入口 ─────────────────────────
+
+
+def _uploads_dir() -> Path:
+    """原件落盘目录（backend/uploads/），不存在则创建。"""
+    settings = get_settings()
+    p = Path(settings.UPLOAD_DIR)
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent.parent / settings.UPLOAD_DIR
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _save_original(filename: str, content: bytes, file_hash: str) -> Path:
+    """原件落盘：哈希命名防同名覆盖，保留原扩展名供重解析识别类型。"""
+    ext = Path(filename).suffix.lower() or ".bin"
+    path = _uploads_dir() / f"{file_hash}{ext}"
+    if not path.exists():
+        path.write_bytes(content)
+    return path
+
+
+def _check_duplicate(file_hash: str) -> bool:
+    """按内容哈希查 Milvus 是否已入库同名内容。"""
+    return milvus.has_file_hash(file_hash)
+
+
+def ingest_file(filename: str, content: bytes, split_mode: str | None = None, replace: bool = False) -> dict:
+    """解析上传文件并写入向量库，返回摄入统计。
+
+    split_mode: auto（默认）/ semantic / fixed / markdown。
+    replace=True 时内容哈希重复则先删除旧块再重新入库。
+    """
+    settings = get_settings()
+    file_hash = hashlib.sha256(content).hexdigest()
+    if _check_duplicate(file_hash):
+        if not replace:
+            raise DuplicateFileError(filename, file_hash)
+        milvus.delete_by_hash(file_hash)
+
     ext = Path(filename).suffix.lower()
+    use_v2 = settings.PARSER_ENGINE == "v2" and ext in _MARKDOWN_CAPABLE
+    # split_mode 解析：v2 可结构化类型 auto 时默认走 markdown 分块
+    effective_split_mode = split_mode
+    if use_v2 and split_mode in (None, "auto"):
+        effective_split_mode = "markdown"
+
     suffix = ext if ext in SUPPORTED_EXTENSIONS or ext in (".xlsx", ".pptx") else ".bin"
     # PyPDFLoader / Docx2txtLoader 需要文件路径，写临时文件
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
     try:
-        raw_docs = _load_documents(tmp_path)
+        if use_v2:
+            from core import cleaning
+            from core.parsers import load_documents
+
+            raw_docs = load_documents(tmp_path)
+            if ext == ".pdf":
+                # 分页分隔线剔除 + 跨页重复行（页眉/页脚/页码）清洗
+                raw_docs = [
+                    Document(page_content=cleaning.strip_separators(d.page_content), metadata=d.metadata)
+                    for d in raw_docs
+                ]
+                raw_docs = [d for d in raw_docs if d.page_content]
+                raw_docs = cleaning.strip_repeated_lines(raw_docs)
+        else:
+            raw_docs = _legacy_load_documents(tmp_path)
         if not raw_docs:
             raise ValueError("文档内容为空或无法解析")
-        split_docs, used_mode = _split_documents(raw_docs, split_mode)
-        enriched = _make_metadata_docs(split_docs, filename, chunk_type=used_mode)
+        split_docs, used_mode = _split_documents(raw_docs, effective_split_mode)
+        enriched = _make_metadata_docs(split_docs, filename, chunk_type=used_mode, file_hash=file_hash)
         ids = milvus.add_documents(enriched)
+        _save_original(filename, content, file_hash)
+
+        # 获取 VLM 处理计数
+        vlm_pages = get_vlm_client().get_processed_count()
+
         return {
             "ids": ids,
             "chunk_count": len(enriched),
             "filename": filename,
             "chunk_type": used_mode,
+            "file_hash": file_hash,
+            "vlm_pages": vlm_pages,
         }
     finally:
         if os.path.exists(tmp_path):
@@ -242,6 +356,7 @@ def list_documents() -> list[dict]:
                 "filename": name,
                 "chunk_count": 0,
                 "upload_time": doc.metadata.get("upload_time"),
+                "file_hash": doc.metadata.get("file_hash"),
             }
         by_name[name]["chunk_count"] += 1
     return sorted(by_name.values(), key=lambda d: d.get("upload_time") or 0, reverse=True)

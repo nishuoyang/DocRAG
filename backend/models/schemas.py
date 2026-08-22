@@ -13,13 +13,16 @@ class DocumentInfo(BaseModel):
     filename: str = Field(description="文件名")
     chunk_count: int = Field(description="该文档入库的分块数量")
     upload_time: int | None = Field(default=None, description="上传时间戳（秒）")
+    file_hash: str | None = Field(default=None, description="文件内容 SHA256 哈希（去重用）")
 
 
 class DocumentUploadResponse(BaseModel):
     filename: str = Field(description="已上传的文件名")
     chunk_count: int = Field(description="入库的分块数量")
     ids: list[int] = Field(description="写入 Milvus 的向量 ID 列表")
-    chunk_type: str | None = Field(default=None, description="实际使用的切分策略：semantic / fixed")
+    chunk_type: str | None = Field(default=None, description="实际使用的切分策略：semantic / fixed / markdown")
+    file_hash: str | None = Field(default=None, description="文件内容 SHA256 哈希")
+    vlm_pages: int = Field(default=0, description="VLM 多模态实际处理的页数/图片数（成本可见）")
 
 
 class DocumentListResponse(BaseModel):
@@ -45,3 +48,15 @@ class ChatResponse(BaseModel):
 
 class MemoryResponse(BaseModel):
     messages: list[ChatMessage] = Field(description="历史对话消息（按时间升序）")
+
+
+class JobInfoResponse(BaseModel):
+    job_id: str = Field(description="任务 ID")
+    filename: str = Field(description="文件名")
+    status: str = Field(description="任务状态：pending / processing / completed / failed")
+    progress: int = Field(description="处理进度（0-100）")
+    message: str = Field(description="当前状态描述")
+    created_at: str = Field(description="创建时间（ISO 格式）")
+    updated_at: str = Field(description="更新时间（ISO 格式）")
+    result: dict | None = Field(default=None, description="任务结果（仅 completed 状态有值）")
+    error: str | None = Field(default=None, description="错误信息（仅 failed 状态有值）")

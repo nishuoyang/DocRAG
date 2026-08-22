@@ -45,6 +45,18 @@ class Settings(BaseSettings):
     # 上传限制 (MB)
     MAX_UPLOAD_MB: int = 20
 
+    # ── 解析 v2（结构化解析 + Markdown 分块）──
+    # 上传原件落盘目录（支持重解析/迁移重建 collection）
+    UPLOAD_DIR: str = "uploads"
+    # 解析引擎：v2 = 结构化解析器 + Markdown 结构分块；legacy = 旧链路（回滚开关）
+    PARSER_ENGINE: str = "v2"
+    # VLM 多模态（P2 预留）：扫描件页面读图 / 内嵌图片描述
+    VLM_ENABLED: bool = True
+    VLM_MODEL: str = "Qwen/Qwen2.5-VL-72B-Instruct"
+    VLM_BASE_URL: str = "https://api.siliconflow.cn/v1"
+    VLM_API_KEY: str = ""
+    VLM_MAX_PAGES: int = 30  # 单文档 VLM 处理页数上限（成本熔断）
+
     @property
     def llm_base_url(self) -> str:
         """根据 LLM_PROVIDER 解析 base_url，custom 时读 LLM_BASE_URL。"""

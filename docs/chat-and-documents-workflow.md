@@ -1,6 +1,6 @@
 # Chat 与 Documents 工作流程详解
 
-> 适用版本：当前 main 分支（后端 FastAPI + 前端 Vue 3 + RAGAS 评估）。
+> 适用版本：v2（结构化解析 + Markdown 分块 + VLM 多模态 + 异步上传）。
 > 阅读本文前建议先看根目录 `CLAUDE.md` 了解整体架构；本文深入每个接口的内部执行流程。
 
 ---
@@ -9,20 +9,22 @@
 
 系统由两大模块组成：
 
-- **Documents（文档管理）**：上传 → 解析 → 分块（固定/语义）→ 向量化 → 入库；以及列表、删除。
+- **Documents（文档管理）**：上传 → 结构化解析（v2）→ 噪声清洗 → Markdown 分块 → 向量化 → 入库；以及列表、删除、进度查询。
 - **Chat（智能问答）**：Query 增强（改写+HYDE）→ 混合检索（向量+BM25）→ Rerank 精排 → LLM 生成 → 答案+来源；支持 SQLite 持久化记忆与 SSE 流式输出。
 
 ```
-┌─────────┐   HTTP   ┌──────────────┐   调用    ┌────────────────────────┐
+┌─────────┐   HTTP   ┌──────────────┐   调用    ┌────────────────────────
 │ 前端 Vue │ ───────▶ │  FastAPI 路由 │ ───────▶ │  core 业务层            │
-└─────────┘          │  api/*.py    │          │  ingestion / retrieval / │
-                     └──────────────┘          │  query_transform /      │
+─────────┘          │  api/*.py    │          │  parsers/ cleaning.py   │
+                     └──────────────┘          │  md_split.py vlm.py     │
+                                              │  ingestion / retrieval / │
+                                              │  query_transform /      │
                                               │  bm25 / rerank / llm    │
-                                              └────────┬───────────────┘
+                                              ────────┬───────────────┘
                                                        │
                                               ┌────────▼─────────┐
                                               │ db/milvus.py     │
-                                              │  (langchain_milvus)│
+                                              │  (pymilvus 直连)  │
                                               └────────┬─────────┘
                                                        │
                                               ┌────────▼─────────┐
@@ -32,8 +34,9 @@
 
 | 功能 | 路由 | 调用链 |
 |---|---|---|
-| 上传文档 | `POST /documents/upload` | `api/documents.py` → `core/ingestion.py` → `db/milvus.py` → Milvus |
-| 文档列表 | `GET /documents` | `api/documents.py` → `core/ingestion.py` → `db/milvus.py` → Milvus |
+| 上传文档 | `POST /documents/upload` | `api/documents.py` → `core/jobs.py`（创建任务）→ 后台 `core/ingestion.py` → `core/parsers/` → `core/cleaning.py` → `core/md_split.py` → `db/milvus.py` → Milvus |
+| 查询进度 | `GET /documents/jobs/{job_id}` | `api/documents.py` → `core/jobs.py`（SQLite） |
+| 文档列表 | `GET /documents` | `api/documents.py` → `core/ingestion.py` → `db/milvus.py`（pymilvus 直连）→ Milvus |
 | 删除文档 | `DELETE /documents/{filename}` | `api/documents.py` → `core/ingestion.py` → `db/milvus.py` → Milvus |
 | 历史记忆 | `GET /chat/memory` | `api/chat.py` → `db/memory.py`（SQLite） |
 | 单轮问答 | `POST /chat` | `api/chat.py` → `core/retrieval.py` → query_transform/bm25/rerank/milvus → `core/llm.py` |
@@ -45,73 +48,141 @@
 
 ## 2. Documents 模块工作流程
 
-### 2.1 上传文档：`POST /documents/upload`
+### 2.1 上传文档：`POST /documents/upload`（异步）
 
-**请求**：`multipart/form-data`，字段 `file`（支持 PDF/DOCX/TXT/MD/CSV/XLSX/PPTX/HTML，最大 20MB）+ 可选 `split_mode`（`semantic` | `fixed` | 不传自动）。
+**请求**：`multipart/form-data`，字段 `file`（支持 PDF/DOCX/TXT/MD/CSV/XLSX/PPTX/HTML，最大 20MB）+ 可选 `split_mode`（`auto` | `markdown` | `semantic` | `fixed`，默认 `auto`）+ 可选 `replace`（`true` 覆盖已入库文件）。
 
 **执行步骤**：
 
-1. **格式校验**（[api/documents.py:17-20](backend/api/documents.py#L17-L20)）
+1. **格式校验**（[api/documents.py:27-29](backend/api/documents.py#L27-L29)）
    从 `file.filename` 提取扩展名，白名单 = `ingestion.SUPPORTED_EXTENSIONS` + xlsx/pptx（单一事实源）。
 
-2. **split_mode 校验**（[api/documents.py:23-24](backend/api/documents.py#L23-L24)）
-   仅接受 `semantic` / `fixed`，其他返回 400。
+2. **split_mode 校验**（[api/documents.py:31-32](backend/api/documents.py#L31-L32)）
+   仅接受 `auto` / `markdown` / `semantic` / `fixed`，其他返回 400。
 
-3. **大小校验**（[api/documents.py:28-32](backend/api/documents.py#L28-L32)）
+3. **大小校验**（[api/documents.py:34-40](backend/api/documents.py#L34-L40)）
    一次性读入全部字节（`await file.read()`），按 `MAX_UPLOAD_MB`（默认 20MB）判断，超限返回 413。
 
-4. **摄入处理** `ingestion.ingest_file(filename, content, split_mode)`（[core/ingestion.py:203](backend/core/ingestion.py#L203)），内部 5 步：
-   - **写临时文件**：`NamedTemporaryFile(suffix=ext)`。因为 loader 只接受文件路径，不接受字节流。
-   - **解析** `_load_documents`：按扩展名选 loader（`SUPPORTED_EXTENSIONS` 映射 + 自写 `_load_xlsx` / `_load_pptx`）→ `loader.load()` 得到原始文档对象（PDF 每页一个 Document，DOCX 整体一个，pptx 每页一个）。
-   - **确定切分策略** `_resolve_split_mode`（[core/ingestion.py:121](backend/core/ingestion.py#L121)）：
-     - 手动 `split_mode` 优先
-     - 否则按 `SEMANTIC_SPLIT` 配置：`auto` 时总字符 ≤ `AUTO_SEMANTIC_THRESHOLD`（3000）用 semantic，否则 fixed；`true` 全 semantic；`false` 全 fixed（兼容旧布尔值）
-   - **分块** `_split_documents`（[core/ingestion.py:134](backend/core/ingestion.py#L134)），返回 `(结果, 实际策略)`：
-     - **fixed**：`RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)`，递归分隔符（段落→句子→字符），相邻块重叠防语义切断
-     - **semantic**：`_semantic_split_documents`（[core/ingestion.py:161](backend/core/ingestion.py#L161)）——按句切（`[。！？!?；;]` + 换行）→ 批量 embedding（每批 64 句）→ 相邻句余弦相似度 → 断点 = 低于 `均值-1.5σ` → 按断点合并成块；碎块（<40 字符）合并防碎、过长块（>1000 字符）Recursive 兜底再切、尾部不足 40 字符并入前块不丢内容。**代价：每句一次 embedding API（计费 + 耗时）**
-   - **补充元数据** `_make_metadata_docs`（[core/ingestion.py:98](backend/core/ingestion.py#L98)）：为每个块添加 `filename`、`chunk_index`、`upload_time`（unix 秒）、`chunk_type`（semantic/fixed）；PDF/pptx 额外保留 `page`；xlsx 保留 `sheet`。
+4. **创建后台任务**（[api/documents.py:42-54](backend/api/documents.py#L42-L54)）
+   - `job_manager.create_job(filename)` 创建任务记录（SQLite），返回 `job_id`
+   - `background_tasks.add_task(_process_document_task, ...)` 添加后台任务
+   - 立即返回 `JobInfoResponse`（job_id、filename、status=pending、progress=0）
 
-5. **写入向量库** `milvus.add_documents(enriched)`（[db/milvus.py:44](backend/db/milvus.py#L44)）：
-   - `get_vectorstore()` 建立 langchain_milvus 连接（内部调用 `core/embeddings.py` 把文本转成 1024 维向量）。
-   - `vs.add_documents(docs)`：文本 → 向量 → 连同元数据写入 Milvus Collection。
-   - **Collection 不存在时自动创建**，命名 `doc_collection_` + Embedding 模型名 slug；**`metadata_schema` 显式声明 chunk_type 字段**（VARCHAR 32）——langchain-milvus 默认按首批 metadata 定 schema，新字段会静默丢失。
-
-6. **清理与返回**：`finally` 中删除临时文件（无论成败）；返回 `{filename, chunk_count, ids, chunk_type}`。
+5. **后台任务处理** `_process_document_task`（[api/documents.py:71-138](backend/api/documents.py#L71-L138)）
+   - 更新状态为 `processing`，progress=10
+   - 调用 `ingestion.ingest_file()`（[core/ingestion.py:284](backend/core/ingestion.py#L284)），内部流程：
+     - **SHA256 去重**：计算文件哈希，若已入库且 `replace=false` 则抛 `DuplicateFileError`
+     - **写临时文件**：`NamedTemporaryFile(suffix=ext)`。因为 loader 只接受文件路径，不接受字节流。
+     - **v2 解析** `_load_documents`（[core/parsers/__init__.py](backend/core/parsers/__init__.py)）：
+       - PDF → `pymupdf4llm` 逐页输出 Markdown（表格转 GFM、标题带 `#` 层级）
+       - DOCX → `python-docx` 顺序遍历 body（标题 Heading 1-9 → `#` 层级、表格转 GFM）
+       - PPTX → `python-pptx` 逐页提取文本 + 表格
+       - XLSX → `pandas` 按 sheet 分行
+       - CSV/HTML/TXT/MD → langchain loader
+     - **噪声清洗**（[core/cleaning.py](backend/core/cleaning.py)）：PDF 逐页剔除跨页重复行（页眉/页脚/页码）
+     - **确定切分策略** `_resolve_split_mode`（[core/ingestion.py:221](backend/core/ingestion.py#L221)）：
+       - 手动 `split_mode` 优先
+       - `auto` 时 PDF/DOCX 走 `markdown`，其他按 `SEMANTIC_SPLIT` 配置（<3000 字符语义、否则固定）
+     - **分块** `_split_documents`（[core/ingestion.py:234](backend/core/ingestion.py#L234)），返回 `(结果，实际策略)`：
+       - **markdown**（[core/md_split.py](backend/core/md_split.py)）：按 `#` 标题切节 → 节内文本超长 Recursive 切分（每块前置 `[章节：path]`）→ GFM 表格永不切断、超大表按行分组重复表头 → `chunk_type="markdown"`
+       - **fixed**：`RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)`
+       - **semantic**：按句切 → 批量 embedding → 相邻句余弦相似度 → 断点 = 低于 `均值 -1.5σ` → 按断点合并成块
+     - **补充元数据** `_make_metadata_docs`（[core/ingestion.py:194](backend/core/ingestion.py#L194)）：为每个块添加 `filename`、`chunk_index`、`upload_time`、`chunk_type`、`section`（章节路径）、`content_type`（text/table）、`file_hash`（SHA256）；PDF/pptx 额外保留 `page`
+     - **写入向量库** `milvus.add_documents(enriched)`（[db/milvus.py:51](backend/db/milvus.py#L51)）
+     - **原件落盘** `_save_original`（[core/ingestion.py:260](backend/core/ingestion.py#L260)）：哈希命名存入 `backend/uploads/`，支持后续重解析
+   - 更新状态为 `completed`，progress=100，保存 result（chunk_count、chunk_type、file_hash、vlm_pages）
+   - 异常时更新为 `failed`，保存 error 信息
 
 **异常处理**：
-- `ValueError`（空文档/无法解析）→ 400，前端展示错误信息。
-- 其他异常 → 500 `文档处理失败: <原因>`。
+- `DuplicateFileError` → 409（可 `replace=true` 覆盖）
+- `ValueError`（空文档/无法解析）→ 400，前端展示错误信息
+- 其他异常 → 500 `文档处理失败：<原因>`
 
-**响应示例**：
+**响应示例**（立即返回）：
 ```json
-{ "filename": "notes.md", "chunk_count": 3, "ids": [12345], "chunk_type": "semantic" }
+{
+  "job_id": "78a2d67e-01d3-47f0-9228-7c45d74737bb",
+  "filename": "test.txt",
+  "status": "pending",
+  "progress": 0,
+  "message": "任务已创建",
+  "created_at": "2026-08-20T15:36:40.324568",
+  "updated_at": "2026-08-20T15:36:40.324568",
+  "result": null,
+  "error": null
+}
 ```
 
-### 2.2 文档列表：`GET /documents`
+### 2.2 查询进度：`GET /documents/jobs/{job_id}`
 
 **执行步骤**：
 
-1. `milvus.get_all_documents()`（[db/milvus.py:57](backend/db/milvus.py#L57)）：
-   - **collection 尚未创建（首次上传前）→ 直接返回空列表**（`vs.col is None` 防护）。
-   - 用底层 `vs.col.query` 分页拉取全部数据（每批 100 条，`offset` 递增直到取完），output_fields 含 `chunk_type`。
-   - 每条数据重建为 `Document`，元数据含 `pk`/`filename`/`chunk_index`/`upload_time`/`chunk_type`。
+1. `job_manager.get_job(job_id)`（[core/jobs.py:87](backend/core/jobs.py#L87)）：
+   - 从 SQLite 查询任务记录
+   - 不存在 → 返回 404
 
-2. `ingestion.list_documents()`（[core/ingestion.py:230](backend/core/ingestion.py#L230)）：
-   - 按 `filename` 聚合：同文件所有 chunk 合并为一条记录，`chunk_count` 累计块数。
-   - 按 `upload_time` 降序排序（新上传的在前）。
+2. 返回 `JobInfoResponse`（job_id、filename、status、progress、message、created_at、updated_at、result、error）
 
-3. 返回 `{documents: [...], total: N}`。
+**响应示例**（处理中）：
+```json
+{
+  "job_id": "78a2d67e-01d3-47f0-9228-7c45d74737bb",
+  "filename": "test.txt",
+  "status": "processing",
+  "progress": 60,
+  "message": "分块完成，正在向量化...",
+  "created_at": "2026-08-20T15:36:40.324568",
+  "updated_at": "2026-08-20T15:36:42.807795",
+  "result": null,
+  "error": null
+}
+```
 
-### 2.3 删除文档：`DELETE /documents/{filename}`
+**响应示例**（已完成）：
+```json
+{
+  "job_id": "78a2d67e-01d3-47f0-9228-7c45d74737bb",
+  "filename": "test.txt",
+  "status": "completed",
+  "progress": 100,
+  "message": "文档处理完成",
+  "result": {
+    "chunk_count": 1,
+    "chunk_type": "semantic",
+    "file_hash": "57cb5792017c8d0dca82652da1199f726d5e221690c8c81baebefa1add48bc6b",
+    "vlm_pages": 0
+  },
+  "error": null
+}
+```
+
+### 2.3 文档列表：`GET /documents`
 
 **执行步骤**：
 
-1. `ingestion.delete_document(filename)` → `milvus.delete_document(filename)`（[db/milvus.py:95](backend/db/milvus.py#L95)）：
-   - collection 不存在 → 返回 0。
-   - 构造表达式 `filename == "<filename>"`，用底层 `vs.col.delete` 删除**该文件名对应的全部向量块**。
-   - 返回 `delete_count`。
+1. `milvus.get_all_documents()`（[db/milvus.py:64](backend/db/milvus.py#L64)）：
+   - **直接用 pymilvus Collection 查询**（不依赖 embedding 配置，避免 `EMBEDDING_API_KEY` 为空时报错）
+   - **动态检测可用字段**，兼容旧 schema（无 section/content_type/file_hash/page 字段也能正常读取）
+   - 用底层 `col.query` 分页拉取全部数据（每批 100 条，`offset` 递增直到取完）
+   - 每条数据重建为 `Document`，元数据含 `pk`/`filename`/`chunk_index`/`upload_time`/`chunk_type`/`section`/`content_type`/`file_hash`/`page`
 
-2. 删除 0 条 → `404 未找到文档`；否则返回 `{filename, deleted}`。
+2. `ingestion.list_documents()`（[core/ingestion.py:348](backend/core/ingestion.py#L348)）：
+   - 按 `filename` 聚合：同文件所有 chunk 合并为一条记录，`chunk_count` 累计块数
+   - 按 `upload_time` 降序排序（新上传的在前）
+
+3. 返回 `{documents: [...], total: N}`
+
+### 2.4 删除文档：`DELETE /documents/{filename}`
+
+**执行步骤**：
+
+1. `ingestion.delete_document(filename)` → `milvus.delete_document(filename)`（[db/milvus.py:115](backend/db/milvus.py#L115)）：
+   - collection 不存在 → 返回 0
+   - 构造表达式 `filename == "<filename>"`，用底层 `col.delete` 删除**该文件名对应的全部向量块**
+   - `col.flush()` 保证删除对后续查询可见
+   - 返回 `delete_count`
+
+2. 删除 0 条 → `404 未找到文档`；否则返回 `{filename, deleted}`
 
 **注意**：按文件名精确匹配（同名文件一起删）；删除的是 Milvus 向量，不是磁盘文件；不可撤销。
 
@@ -147,15 +218,15 @@
 ① api/chat.py 转发到 retrieval.rag_stream()
         │
         ▼
-② rag_stream: _retrieve 放 asyncio.to_thread 执行（不阻塞事件循环）
+ rag_stream: _retrieve 放 asyncio.to_thread 执行（不阻塞事件循环）
         │
         ├─ ③ _build_search_queries: 原 query + 改写 + HYDE 并行（ThreadPoolExecutor）
         │      └─ LLM 失败 → 降级原 query（绝不抛出）
         │
-        ├─ ④ 每个查询分别做: 向量检索(10条) + BM25 检索(10条)
+        ├─ ④ 每个查询分别做：向量检索 (10 条) + BM25 检索 (10 条)
         │      └─ 全部合并去重（按文本内容）→ 候选池（最多 ~30 条）
         │
-        ├─ ⑤ rerank.rerank(原始query, 候选, top_n=top_k)
+        ├─ ⑤ rerank.rerank(原始 query, 候选，top_n=top_k)
         │      └─ SiliconFlow bge-reranker-v2-m3 交叉编码 → 相关性分数排序
         │      └─ 未配置/关闭 → 跳过，取候选前 top_k
         │
@@ -163,7 +234,7 @@
         │
         ├─ ⑦ _resolve_history: 前端 history 优先，否则 SQLite 记忆取最近 6 轮
         │
-        ├─ ⑧ _build_messages: system(提示词+参考资料) + history + query
+        ├─ ⑧ _build_messages: system(提示词 + 参考资料) + history + query
         │
         ├─ ⑨ chat.astream(messages) 流式调用 LLM
         │      └─ 每个 chunk → yield {"delta": "..."}   ← 逐字推送
@@ -172,7 +243,7 @@
         │
         ├─ ⑪ yield "data: [DONE]"                      ← 流结束标记
         │
-        └─ ⑫ 写记忆: user=query, assistant=完整回答 → SQLite
+        └─ ⑫ 写记忆：user=query, assistant=完整回答 → SQLite
 ```
 
 **逐步说明**：
@@ -203,7 +274,7 @@
 **⑧ 构建 messages**（[core/retrieval.py:36](backend/core/retrieval.py#L36)）
 ```
 1. system: 系统提示词 + 检索到的参考资料（按 [i] 编号 + 来源文件名）
-2. user/assistant 交替: 历史对话（最近 6 轮）
+2. user/assistant 交替：历史对话（最近 6 轮）
 3. user: 当前问题
 ```
 关键设计：`_format_context` 要求 LLM 只依据资料回答、不编造、数字以原文为准；检索与生成解耦——每次提问重新检索，历史不参与检索，保证回答基于最新入库文档。
@@ -257,26 +328,32 @@ data: [DONE]
  │                              │                              │                      │
  │  POST /documents/upload ────▶│                              │                      │
  │  (multipart + split_mode)    │ 校验格式/split_mode/大小       │                      │
- │                              │ 写临时文件 → 解析 → 分块        │                      │
- │                              │ (fixed 或 semantic) → 补元数据 │                      │
+ │                              │ 创建 job → 返回 job_id        │                      │
+ │ ◀── 200 {job_id, status=pending}                            │                      │
+ │                              │                              │                      │
+ │                              │ [后台任务]                    │                      │
+ │                              │ 解析 → 清洗 → 分块            │                      │
  │                              │ ──▶ add_documents ──────────▶│                      │
  │                              │                              │ Embedding 调用 ──────▶│
- │                              │                              │◀── 1024 维向量 ───────│
+ │                              │                              │── 1024 维向量 ───────│
  │                              │◀─ 写入完成 ──────────────────│                      │
- │ ◀── 200 {filename,chunk_count,ids,chunk_type}               │                      │
+ │                              │ 更新 job status=completed    │                      │
+ │                              │                              │                      │
+ │  GET /documents/jobs/{id} ──▶│◀─ 查询 SQLite ──────────────│                      │
+ │ ── 200 {status, progress}  │                              │                      │
  │                              │                              │                      │
  │  POST /chat/stream ────────▶│                              │                      │
  │  {query}                     │ 改写+HYDE 并行（LLM 2 次）────▶────────────────────▶│
- │                              │ 每个查询: 向量+BM25 检索 ────▶│ Embedding 调用 ──────▶│
+ │                              │ 每个查询：向量+BM25 检索 ────▶│ Embedding 调用 ──────▶│
  │                              │◀─ 候选池（去重） ─────────────│                      │
  │                              │ rerank 精排（原始 query）─────▶────────────────────▶│
  │                              │ 拼 system+history+query       │                      │
  │                              │ chat.astream ────────────────▶────────────────────▶│
- │ ◀── data: {"delta":"..."} ──│◀─ token 流 ──────────────────│◀── token 流 ─────────│
+ │ ◀── data: {"delta":"..."} ──│─ token 流 ──────────────────│◀── token 流 ─────────│
  │ ◀── data: {"sources":[...]} │                              │                      │
  │ ◀── data: [DONE]            │                              │                      │
  │                              │ 写记忆 → SQLite              │                      │
- │  GET /chat/memory ─────────▶│◀─ 读取 SQLite ───────────────│                      │
+ │  GET /chat/memory ─────────▶│─ 读取 SQLite ───────────────│                      │
  │ ◀── {messages: [...]}       │                              │                      │
 ```
 
@@ -287,15 +364,19 @@ data: [DONE]
 | 设计 | 说明 | 影响 |
 |---|---|---|
 | 路由层无业务逻辑 | 校验 + 转发，业务全在 `core/` | 易于测试、复用 |
+| 异步上传 + 进度查询 | 后台任务处理，前端轮询进度 | 大文件上传体验好，不阻塞 HTTP |
+| 结构化解析（v2） | PDF/DOCX 表格转 Markdown、标题层级识别 | 表格类问答质量提升 |
+| Markdown 分块 | 按章节切分、表格保护、每块带章节上下文 | 检索更精准，引用定位更准 |
+| VLM 多模态 | 扫描件 OCR、内嵌图片描述 | 图文混排文档信息不丢失 |
+| 内容哈希去重 | SHA256 哈希，避免重复入库 | 同文件重复上传返回 409（可 replace 覆盖） |
+| 原件落盘 | `backend/uploads/` 哈希命名 | 支持后续重解析/迁移重建 |
 | Query 增强（改写+HYDE） | LLM 补全指代/生成假想答案，扩大召回 | 每轮问答 +2 次 LLM 调用（并行，~3.5s） |
 | 混合召回 | 向量（语义）+ BM25（关键词）互补 | 专有名词/代码片段靠 BM25 补漏 |
 | Rerank 用原始 query | 改写/假文档只用于召回，不参与精排 | 最终排序贴合用户原意 |
 | 记忆 SQLite 持久化 | 存 50 轮、请求层取 6 轮 | 刷新恢复对话，上下文不膨胀 |
-| 切分策略按文档长度 | auto: <3000 字符语义、否则固定 | 语义切分成本花在便宜处；可手动覆盖 |
 | Collection 按模型命名 | `doc_collection_BAAI_bge_m3` | 换 Embedding 模型不冲突，但旧库作废需重传 |
 | Collection schema 定死 | `metadata_schema` 显式声明新字段 | 加字段必须重建 collection（数据丢失） |
-| 无去重 | 同文件重复上传重复入库 | 删除按文件名精确匹配，一并删除 |
-| 上传无事务 | 部分块写入失败无回滚 | 可能残留部分向量 |
+| pymilvus 直连 | `get_all_documents()` 等不依赖 embedding | `EMBEDDING_API_KEY` 为空时文档列表仍正常 |
 
 ---
 
@@ -308,9 +389,11 @@ data: [DONE]
 | 流式卡住无输出 | LLM API 不可用/超时 | 看后端日志 httpx 请求状态；直接 curl 测 LLM 接口 |
 | 首 token 很慢（~7s） | 改写+HYDE+rerank 三次 API 调用 | `.env` 关 `QUERY_TRANSFORM`/`HYDE`/`RERANK_ENABLED` 可加速 |
 | 改 .env 不生效 | `get_settings()` lru_cache | 重启后端进程 |
-| 上传的 chunk_type 是 None | 旧 collection（无该字段） | 重建 collection 后重新上传 |
-| 删除后列表没变 | 文件名含特殊字符导致表达式匹配失败 | 用 `GET /documents` 确认准确文件名 |
+| 上传报错 `文档已入库` | 内容哈希重复 | 前端会提示是否覆盖；或 API 传 `replace=true` |
 | 上传报错 `文档处理失败` | 文件损坏/加密 PDF | 后端日志看具体异常栈 |
+| 删除后列表没变 | 文件名含特殊字符导致表达式匹配失败 | 用 `GET /documents` 确认准确文件名 |
+| VLM 处理页数为 0 | 未配置 `VLM_API_KEY` 或 `VLM_ENABLED=false` | 检查 `.env` 配置 |
+| 上传的 chunk_type 是 None | 旧 collection（无该字段） | 重建 collection 后重新上传 |
 
 ---
 
@@ -375,4 +458,3 @@ questions/ground_truths（docs/test.py）
 - 判分 LLM 偶发输出截断（`IncompleteOutputException`）→ 该题指标为 NaN，重跑即可
 - 检索失败（返回默认"未检索到"文案）时 answer_relevancy=0，属真实信号（如 #3 api_base 题）
 - 50 题全量约 12 分钟（生成 7 分钟 + 判分 5 分钟），命中缓存后仅判分 ~6 分钟
-

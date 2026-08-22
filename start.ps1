@@ -66,10 +66,10 @@ if (-not (Test-Path $Python)) {
     Write-Error "未找到 $Python，请先安装依赖（poetry install）"
     exit 1
 }
-Write-Info "启动后端 FastAPI (http://127.0.0.1:8000)..."
+Write-Info "启动后端 FastAPI (http://127.0.0.1:8001)..."
 Push-Location $Backend
 try {
-    $BackendProc = Start-Process -FilePath $Python -ArgumentList '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '8000' -PassThru -WindowStyle Hidden
+    $BackendProc = Start-Process -FilePath $Python -ArgumentList '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '8001' -PassThru -WindowStyle Hidden
 } finally {
     Pop-Location
 }
@@ -94,11 +94,11 @@ if (-not $BackendOnly) {
 }
 
 # 等后端就绪后提示访问地址
-if (-not (Wait-Health 'http://127.0.0.1:8000/health' '后端 FastAPI' 60)) { exit 1 }
+if (-not (Wait-Health 'http://127.0.0.1:8001/health' '后端 FastAPI' 60)) { exit 1 }
 
 Write-Host ""
 Write-Host "=== 服务已启动 ===" -ForegroundColor Green
-Write-Host "  后端 API:   http://127.0.0.1:8000 (Swagger: /docs)"
+Write-Host "  后端 API:   http://127.0.0.1:8001 (Swagger: /docs)"
 if (-not $BackendOnly) {
     Write-Host "  前端页面:   http://localhost:5173"
 }
