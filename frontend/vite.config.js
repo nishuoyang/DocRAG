@@ -10,6 +10,7 @@ export default defineConfig({
       '/health': 'http://localhost:8001',
       '/documents': 'http://localhost:8001',
       '/chat': 'http://localhost:8001',
+      '/agent': 'http://localhost:8001',
     },
   },
 })
