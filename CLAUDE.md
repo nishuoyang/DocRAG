@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-基于 LangChain 的垂直领域智能文档问答系统（RAG）：上传 PDF/DOCX 等 8 种格式 → 结构化解析（v2 引擎）→ 分块向量化存入 Milvus → 混合检索（向量+BM25+Query增强+rerank）→ LLM 生成带来源的回答。前后端分离：`backend/`（FastAPI）+ `frontend/`（Vue 3）。LLM/Embedding/Rerank 均用 OpenAI 兼容的云 API（Embedding/Rerank 走硅基流动 SiliconFlow，LLM 走 DeepSeek 官方），不运行本地模型。
+基于 LangChain 的垂直领域智能文档问答系统（RAG）：上传 PDF/DOCX 等 8 种格式 → 结构化解析（v2 引擎）→ 分块向量化存入 Milvus → 混合检索（向量+BM25+Query增强+rerank）→ LLM 生成带来源的回答。**上层叠加多 Agent 研究助理工作台**（LangGraph supervisor 调度 文档/联网/数据/写作/多跳 5 个成员 agent，`/agent/chat/stream` SSE 事件流）。前后端分离：`backend/`（FastAPI）+ `frontend/`（Vue 3）。LLM/Embedding/Rerank 均用 OpenAI 兼容的云 API（Embedding/Rerank 走硅基流动 SiliconFlow，LLM 走 DeepSeek 官方），不运行本地模型。
 
 **v2 升级亮点**：
 - 结构化解析：PDF/DOCX 表格转 Markdown、标题层级识别
@@ -27,7 +27,7 @@ cd backend && ./.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --
 # 后端 lint
 cd backend && ./.venv/Scripts/ruff.exe check .
 
-# 前端（Vite dev server，代理 /health /documents /chat 到 8001）
+# 前端（Vite dev server，代理 /health /documents /chat /agent 到 8001）
 cd frontend && npm run dev      # http://localhost:5173（注意用 localhost 而非 127.0.0.1，Vite 默认只监听 IPv6）
 
 # 前端生产构建（产物 frontend/dist/，由 FastAPI 静态托管）
@@ -125,7 +125,7 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 - 无 Vue Router / Pinia / TypeScript — 单页操作台
 - `src/App.vue` — 左侧导航（聊天 / 文档管理）切换右侧面板
 - `src/api.js` — fetch 封装。`chatStream` 解析 SSE：`data: {json}\n\n` 事件流，支持 `delta`（流式文本）、`sources`（引用）、`answer`（空库兜底）、`[DONE]`；新增 `getJobStatus(jobId)` 查询上传进度
-- `src/components/`：`ChatPanel.vue`（流式对话 + Top-K 滑块 + 打字机渲染 + 首 token 前思考动画）、`DocManager.vue`（拖拽上传 + 切分策略下拉 + 进度条 + 列表 + 删除）、`SourceCard.vue`（来源展开卡片）
+- `src/components/`：`ChatPanel.vue`（流式对话 + Top-K 滑块 + 打字机渲染 + 首 token 前思考动画）、`AgentPanel.vue`（多 agent 工作台：活动日志 + 流式回答 + 文档/网页双型来源）、`DocManager.vue`（拖拽上传 + 切分策略下拉 + 进度条 + 列表 + 删除）、`SourceCard.vue`（来源展开卡片）
 
 ## 关键约束与已知问题
 

@@ -33,3 +33,5 @@ reports/
 backend/.ragas_cache.json
 backend/.ragas_kg_cache.json
 backend/.ragas_personas.json
+
+uploads/

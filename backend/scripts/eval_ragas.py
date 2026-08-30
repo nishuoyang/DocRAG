@@ -15,6 +15,23 @@
     --no-rerank           关闭 Rerank 重排序
     --no-cache            忽略缓存强制重新生成（换文档库/检索参数后必须）
     --report-dir DIR      报告输出目录（默认 reports/，相对项目根）
+    --nan-handling MODE   NaN 处理策略：keep（默认，统计跳过 NaN 并标注）/ drop / zero
+    --judge-raw           判分 LLM 不包装 LangchainLLMWrapper（回退旧行为，用于对比验证）
+
+NaN 处理说明：
+    ragas 0.4.3 下 NaN 的主要来源（已按本项目链路核对源码）：
+    1) 判分 LLM（DeepSeek）输出非严格 JSON（```json 围栏/夹杂解释/字段缺失）→ PydanticPrompt
+       对 LangChain LLM 直连分支不重试直接解析失败 → evaluate(raise_exceptions=False) 吞成 NaN。
+       对策：默认把 judge 包装成 LangchainLLMWrapper，走 extract_json + fix_output_format 重试；
+       仍失败时用 --judge-raw 与旧行为对比，或换更稳的判分模型（RAGAS_LLM_MODEL）。
+    2) 回答为空 / 兜底回答 → faithfulness 提取不出 statements → NaN。生成阶段已拦截空回答。
+    3) ground_truth 为空 → context_recall/precision 判分异常 → NaN。已跳过并计数。
+    4) 缓存脏数据（空 response/contexts）→ 自动识别并强制重新生成。
+    5) answer_relevancy 依赖 embedding：gen_questions 全空或 embedding 异常 → NaN。同属 LLM
+       JSON 解析问题，包装 judge 后显著减少；仍出现时检查 SiliconFlow embedding 是否限流/超时。
+    脚本在判分后输出逐指标 NaN 统计与涉及题号（含回答摘要），结合 ragas 的 warning 日志
+    （"No statements were generated" / "did not return a valid classification" 等）即可定位根因。
+    keep 口径下均值用 pandas skipna（NaN 不计入），报告 meta 的 nan_counts 记录每指标 NaN 条数。
 
 Judge LLM 与 Embedding 均复用 .env 配置（DeepSeek + SiliconFlow bge-m3），不改 .env。
 兼容环境变量（CLI 优先）：
@@ -22,12 +39,23 @@ Judge LLM 与 Embedding 均复用 .env 配置（DeepSeek + SiliconFlow bge-m3）
 """
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 import traceback
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
+
+# 显示 ragas 判分日志（"No statements were generated" / "did not return a valid classification"
+# / "Invalid response format" 等 warning 是定位 NaN 的第一手线索）
+logging.basicConfig(
+    level=logging.WARNING,
+    format="[%(levelname)s] %(name)s: %(message)s",
+)
 
 # 把 backend/ 加入 sys.path，复用项目代码与 .env 配置
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -78,6 +106,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-rerank", action="store_true", help="关闭 Rerank 重排序")
     parser.add_argument("--no-cache", action="store_true", help="忽略缓存，强制重新走检索链路生成")
     parser.add_argument("--report-dir", default="reports", help="报告输出目录（默认 reports/，相对项目根）")
+    parser.add_argument(
+        "--nan-handling",
+        choices=["keep", "drop", "zero"],
+        default="keep",
+        help="NaN 处理策略（默认 keep）：keep=聚合统计跳过 NaN（skipna）并在报告中标注；"
+        "drop=只统计无 NaN 的行；zero=把 NaN 视为 0 分计入。逐条明细始终全量展示，NaN 显示为 -",
+    )
+    parser.add_argument(
+        "--judge-raw",
+        action="store_true",
+        help="判分 LLM 不包装 LangchainLLMWrapper（回退旧行为）。默认包装后走 ragas 的 "
+        "extract_json + fix_output_format 重试分支，能显著降低 DeepSeek 返回非严格 JSON 导致的 NaN",
+    )
     return parser.parse_args()
 
 
@@ -157,15 +198,28 @@ def run_generation(
     samples = []
     failures = 0
     for i, (q, refs) in enumerate(zip(questions, ground_truths), 1):
+        # ground_truth 为空 → context_recall/context_precision 判分必然异常（NaN），直接跳过并说明
+        ref = refs[0] if isinstance(refs, list) else refs
+        if not isinstance(ref, str) or not ref.strip():
+            failures += 1
+            print(f"  [{i}/{len(questions)}] 跳过：ground_truth 为空（该题无法评估 context_recall/precision）")
+            continue
+
         from_cache = q in cache
         try:
             if from_cache:
                 entry = cache[q]
-                answer, contexts = entry["response"], entry["contexts"]
-            else:
+                answer, contexts = entry.get("response"), entry.get("contexts")
+                # 缓存数据无效（空回答 / 空上下文，常见于旧缓存或判分失败后回填）→ 强制重新生成
+                if not answer or not answer.strip() or not contexts:
+                    print(f"  [{i}/{len(questions)}] 缓存数据无效（空 response/contexts），重新生成")
+                    from_cache = False
+            if not from_cache:
                 answer, docs = generate_answer(q, top_k)
                 if not docs:
                     raise RuntimeError("检索为空（资料库缺对应内容）")
+                if not answer or not answer.strip():
+                    raise RuntimeError("LLM 返回空回答")
                 contexts = [d.page_content for d in docs]
                 cache[q] = {"response": answer, "contexts": contexts}
                 save_cache(cache)
@@ -173,7 +227,7 @@ def run_generation(
                 SingleTurnSample(
                     user_input=q,
                     response=answer,
-                    reference=refs[0] if isinstance(refs, list) else refs,
+                    reference=ref,
                     retrieved_contexts=contexts,
                 )
             )
@@ -187,16 +241,35 @@ def run_generation(
     return samples, cache, stats
 
 
-def run_evaluation(samples: list[SingleTurnSample]):
+def run_evaluation(samples: list[SingleTurnSample], judge_raw: bool = False):
     """RAGAS 判分 4 项指标，返回 (DataFrame, 指标列表)。"""
     # Judge LLM / Embedding：复用项目 .env 配置（ChatOpenAI + 项目 Embeddings，已验证可跑通）
     settings_obj = get_settings()
-    judge_llm = ChatOpenAI(
+    raw_llm = ChatOpenAI(
         model=os.getenv("RAGAS_LLM_MODEL", settings_obj.LLM_MODEL),
         api_key=os.getenv("RAGAS_LLM_API_KEY", settings_obj.LLM_API_KEY),
         base_url=os.getenv("RAGAS_LLM_BASE_URL", settings_obj.llm_base_url),
         temperature=0,
     )
+    if judge_raw:
+        judge_llm = raw_llm
+        print("判分 LLM：直连 ChatOpenAI（--judge-raw，无 JSON 修复重试）")
+    else:
+        # 包装成 BaseRagasLLM：ragas 0.4.3 的 PydanticPrompt 对 LangChain LLM 直连分支
+        # 直接用 model_validate_json 解析、不重试（见 ragas/prompt/pydantic_prompt.py），
+        # DeepSeek 输出 ```json 围栏 / 夹杂解释文字 / 字段缺失时解析失败 → 该行该指标被
+        # evaluate(raise_exceptions=False) 吞成 NaN。包装后走 extract_json + fix_output_format 重试。
+        # bypass_n=True：DeepSeek 不支持 OpenAI n>1（answer_relevancy 需 n=3，改为发 n 次单请求）；
+        # bypass_temperature=True：保持构造时的 temperature=0，判分确定性不受 wrapper 覆盖。
+        from ragas.llms import LangchainLLMWrapper  # noqa: E402
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            judge_llm = LangchainLLMWrapper(
+                raw_llm, bypass_n=True, bypass_temperature=True
+            )
+        print("判分 LLM：LangchainLLMWrapper 包装（extract_json + fix_output_format 重试，可显著降低 NaN）")
+
     from core.embeddings import get_embeddings  # noqa: F401
 
     # 单例指标注入 LLM / Embeddings
@@ -217,12 +290,58 @@ def run_evaluation(samples: list[SingleTurnSample]):
     return result.to_pandas(), metrics
 
 
+def _safe_round(v, ndigits: int = 4):
+    """NaN → None（JSON 序列化为 null），否则四舍五入。修复 float('nan') 被 json.dumps 输出为非法 NaN。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if np.isnan(f) else round(f, ndigits)
+
+
+def _fmt(v, ndigits: int = 3) -> str:
+    """NaN → '-'，否则格式化浮点。修复 Markdown 里 :.3f 输出 'nan' 字符串的坑。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{f:.{ndigits}f}" if not np.isnan(f) else "-"
+
+
+def diagnose_nan(df) -> dict:
+    """统计各指标 NaN 条数，并逐条打印（题号 + 问题 + 回答摘要），返回 {metric: count}。"""
+    nan_counts = {}
+    for name in METRIC_NAMES:
+        mask = df[name].isna()
+        cnt = int(mask.sum())
+        nan_counts[name] = cnt
+        if cnt:
+            print(f"  [NaN x{cnt}] {name}")
+            for i, row in df[mask].iterrows():
+                q = str(row.get("user_input", ""))[:60].replace("\n", " ")
+                resp = str(row.get("response", ""))[:40].replace("\n", " ")
+                print(f"      #{i + 1} 问题: {q}\n          回答: {resp}…")
+    return nan_counts
+
+
+def apply_nan_policy(df, mode: str):
+    """按 --nan-handling 对全局统计口径做处理（逐条明细不受影响，NaN 仍显示为 -）。"""
+    if mode == "zero":
+        return df.fillna(0.0)
+    if mode == "drop":
+        n = int(df[METRIC_NAMES].isna().any(axis=1).sum())
+        if n:
+            print(f"[nan-handling=drop] 剔除含 NaN 的行 {n} 条，剩余 {len(df) - n} 条参与统计")
+        return df.dropna(subset=METRIC_NAMES).copy()
+    return df
+
+
 def build_json_report(meta: dict, df) -> dict:
-    """序列化评估结果为 JSON 结构（meta / global_metrics / details）。"""
+    """序列化评估结果为 JSON 结构（meta / global_metrics / details），NaN 一律输出 null。"""
     stats = df.describe()
     global_metrics = {
         name: {
-            stat: round(float(stats.loc[stat, name]), 4)
+            stat: _safe_round(stats.loc[stat, name], 4)
             for stat in ["mean", "min", "25%", "50%", "75%", "max"]
         }
         for name in METRIC_NAMES
@@ -231,7 +350,7 @@ def build_json_report(meta: dict, df) -> dict:
     for i, row in df.iterrows():
         item = {"index": i + 1, "question": str(row.get("user_input", ""))}
         for name in METRIC_NAMES:
-            item[name] = round(float(row[name]), 4)
+            item[name] = _safe_round(row[name])
         details.append(item)
     return {"meta": meta, "global_metrics": global_metrics, "details": details}
 
@@ -243,8 +362,8 @@ def build_markdown_report(meta: dict, df, json_filename: str) -> str:
     for name in METRIC_NAMES:
         s = stats[name]
         rows.append(
-            f"| {name} | {s['mean']:.3f} | {s['min']:.3f} | {s['25%']:.3f} | "
-            f"{s['50%']:.3f} | {s['75%']:.3f} | {s['max']:.3f} |"
+            f"| {name} | {_fmt(s['mean'])} | {_fmt(s['min'])} | {_fmt(s['25%'])} | "
+            f"{_fmt(s['50%'])} | {_fmt(s['75%'])} | {_fmt(s['max'])} |"
         )
     overall = df[METRIC_NAMES].mean().mean()
 
@@ -267,7 +386,13 @@ def build_markdown_report(meta: dict, df, json_filename: str) -> str:
         "|------|------|--------|-----|--------|-----|--------|",
         *rows,
         "",
-        f"**综合评分**：{overall:.3f}（四指标均值）",
+        f"**综合评分**：{_fmt(overall)}（四指标均值）",
+        "",
+        "**NaN 统计**（判分失败/无效输出的样本数，不参与均值）：",
+        "",
+        "| 指标 | NaN 条数 |",
+        "|------|---------|",
+        *[f"| {name} | {meta['nan_counts'].get(name, 0)} |" for name in METRIC_NAMES],
         "",
         "## 逐条明细",
         "",
@@ -279,8 +404,8 @@ def build_markdown_report(meta: dict, df, json_filename: str) -> str:
         q_short = (question[:50] + "…") if len(question) > 50 else question
         q_short = q_short.replace("|", "\\|")
         lines.append(
-            f"| {i + 1} | {q_short} | {row['faithfulness']:.3f} | {row['answer_relevancy']:.3f} | "
-            f"{row['context_precision']:.3f} | {row['context_recall']:.3f} |"
+            f"| {i + 1} | {q_short} | {_fmt(row['faithfulness'])} | {_fmt(row['answer_relevancy'])} | "
+            f"{_fmt(row['context_precision'])} | {_fmt(row['context_recall'])} |"
         )
     lines += [
         "",
@@ -339,8 +464,21 @@ def main() -> None:
         print("无可评估样本，退出。")
         sys.exit(1)
     t_eval_start = time.time()
-    df, _metrics = run_evaluation(samples)
+    df, _metrics = run_evaluation(samples, judge_raw=args.judge_raw)
     t_eval_end = time.time()
+
+    # ---- 阶段 5.5：NaN 诊断与处理策略 ----
+    print("\nNaN 诊断（判分失败/LLM 输出无效的样本）：")
+    nan_counts = diagnose_nan(df)
+    total_nan = sum(nan_counts.values())
+    if total_nan:
+        print(
+            "提示：NaN 的常见根因与对策见脚本注释（--judge-raw 回退对比 / 换判分模型 / "
+            "检查 ground_truth 与回答是否为空）；--nan-handling 可控制统计口径（keep/drop/zero）。"
+        )
+    else:
+        print("  无 NaN，全部样本判分成功。")
+    df = apply_nan_policy(df, args.nan_handling)
 
     # ---- 阶段 6：生成报告 ----
     testset_display = testset_path.resolve().relative_to(BACKEND_DIR.parent) if testset_path.is_relative_to(BACKEND_DIR.parent) else str(testset_path)
@@ -351,6 +489,9 @@ def main() -> None:
         "query_transform": effective["query_transform"],
         "hyde": effective["hyde"],
         "rerank": effective["rerank"],
+        "judge_raw": args.judge_raw,
+        "nan_handling": args.nan_handling,
+        "nan_counts": nan_counts,
         "cache_enabled": not no_cache,
         "cache_hits": gen_stats["hit"],
         "total_questions": len(questions),

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 一键启动 RAG 全栈服务：Milvus (docker compose) + 后端 FastAPI + 前端 Vite
+# 一键启动 DocRAG 全栈服务：Milvus (docker compose) + 后端 FastAPI + 前端 Vite
+# 多 Agent 研究助理工作台（LangGraph supervisor + 5 成员 agent）
 # 用法: bash start.sh [--backend-only]
 set -euo pipefail
 
