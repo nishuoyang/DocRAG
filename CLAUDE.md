@@ -54,6 +54,9 @@ cd backend && ./.venv-ragas/Scripts/python.exe -X utf8 scripts/generate_testset.
 #   --style clean              排除 POOR_GRAMMAR/MISSPELLED 错别字风格（仅保留规范问题）
 #   --no-cache                 忽略知识图谱/personas 缓存强制重新抽取
 
+# 多 agent 工作台冒烟（逐 agent 验证：documents/search/data/writer/multi_hop/supervisor）
+cd backend && ./.venv/Scripts/python.exe -X utf8 scripts/smoke_agents.py --agent supervisor
+
 # 查看 Milvus 文档库块内容（主环境 venv 即可，零成本）
 cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 #   --index 3,7,12  按块索引查看   --file 关键词   --query 内容关键词   --full 完整内容
@@ -79,6 +82,7 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 
 - `main.py` — FastAPI 入口。CORS 全开、无认证；启动时校验 Milvus 维度。**静态托管前端 dist 的 mount 必须放在所有 API 路由之后**，否则会抢占 `/health` 等路径
 - `api/documents.py` / `api/chat.py` — 路由层。8 个 endpoint：`GET /health`、`POST /documents/upload`（异步，返回 job_id）、`GET /documents/jobs/{job_id}`（进度查询）、`GET /documents`、`DELETE /documents/{filename}`、`POST /chat`、`POST /chat/stream`（SSE）、`GET /chat/memory`
+- `api/agents.py` — 多 agent 主管路由：`POST /agent/chat/stream`（SSE 事件协议 activity/delta/sources/done，与 /chat/stream 的 delta/sources/[DONE] 协议不同）
 - `core/parsers/` — v2 结构化解析器：`pdf_parser.py`（pymupdf4llm，表格转 GFM）、`docx_parser.py`（python-docx，标题层级+表格）、`pptx_parser.py`（备注页+表格+图片）
 - `core/cleaning.py` — 噪声清洗：跨页重复行（页眉/页脚/页码）剔除
 - `core/md_split.py` — Markdown 结构感知分块：按 `#` 标题切节、节内超长 Recursive 切分并前置章节上下文、GFM 表格永不切断、超大表按行分组重复表头
@@ -88,12 +92,13 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 - `core/query_transform.py` — `transform_query`（LLM 改写补指代）+ `hyde_query`（LLM 生成假想答案）。**任何异常降级返回原 query，绝不抛出**；`lru_cache` 按 prompt 缓存
 - `core/bm25.py` — 内存 BM25 索引（rank_bm25 + jieba 中文分词）。缓存键含块数，上传/删除自动重建；语料到万级块需换 Milvus 原生 BM25
 - `core/rerank.py` — SiliconFlow `/rerank` API，`RERANK_ENABLED=false` 或未配 key 时跳过
+- `core/agents/` — 多 agent 研究助理工作台：`supervisor.py`（LangGraph 决策循环 decide↔tools，超轮次 force_final 收尾）→ 5 个成员 agent（`agents.py`：documents 复用 `retrieval._retrieve`、search 走 Tavily/Bocha HTTP、data 生成 pandas 脚本经 `data_exec.py` 白名单子进程执行、writer 模板成稿、multi_hop 拆子问题逐轮查证）；`api/agents.py` 提供 `POST /agent/chat/stream`（SSE 事件：activity/delta/sources/done，最终回答打字机逐段推送，与真实流式等价）
 - `core/ingestion.py` — 文档摄入：v2 解析（parsers/）→ 噪声清洗（cleaning.py）→ 结构分块（md_split.py）→ 补充元数据（含 section/content_type/file_hash）→ SHA256 去重 → 写入 Milvus；原件落盘 `backend/uploads/` 支持重解析
 - `core/embeddings.py` / `core/llm.py` — `@lru_cache` 工厂，OpenAI 兼容
 - `db/milvus.py` — Collection 以 Embedding 模型名命名（换模型避免维度冲突）；**新 schema 显式声明 section/content_type/file_hash/page 字段**（page 为 nullable INT64）；`_get_collection()` 直接用 pymilvus 连接（不依赖 embedding 配置），`get_all_documents()`/`delete_document()` 兼容旧 schema（动态检测字段）
 - `db/memory.py` — SQLite 单表持久化对话（最近 100 条 = 50 轮，自动截断），单连接 `check_same_thread=False`
 - `models/schemas.py` — Pydantic 模型（请求/响应，含 Swagger 描述），新增 `JobInfoResponse`
-- `config.py` — `Settings`（pydantic-settings）+ `get_settings()` 缓存。**改 .env 后需重启进程，lru_cache 不自动刷新**；新增 `UPLOAD_DIR`、`PARSER_ENGINE`、`VLM_ENABLED`、`VLM_MODEL`、`VLM_API_KEY`、`VLM_BASE_URL`、`VLM_MAX_PAGES`
+- `config.py` — `Settings`（pydantic-settings）+ `get_settings()` 缓存。**改 .env 后需重启进程，lru_cache 不自动刷新**；新增 `UPLOAD_DIR`、`PARSER_ENGINE`、`VLM_ENABLED`、`VLM_MODEL`、`VLM_API_KEY`、`VLM_BASE_URL`、`VLM_MAX_PAGES`、`SEARCH_PROVIDER`、`SEARCH_API_KEY`、`DATA_EXEC_TIMEOUT`、`AGENT_MAX_TURNS`
 
 ### 评估 `backend/scripts/`
 
@@ -130,7 +135,8 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 - **内容哈希去重**：同文件重复上传返回 409（可 `replace=true` 覆盖）
 - 上传失败无回滚（临时文件已清理，但部分写入的向量残留）
 - **Collection schema 在建库时定死**：加新 metadata 字段必须 `metadata_schema` 声明 + 重建 collection（现有数据丢失）
-- **依赖版本已漂移**：langchain-core 实际 1.5.3（装 langchain-experimental 时被升），pyproject 锁 ^0.3.0。当前 Milvus/LLM 链路实测正常，但升依赖前需验证
+- **依赖版本已漂移**：langchain-core 实际 1.6.1（装 langgraph 1.x 时被升；# 记载原 1.5.3，实际安装时还是 0.3.86——两次过程都有漂移），pyproject 锁 ^0.3.0。当前 Milvus/LLM/multi-agent 链路实测正常，但升依赖前需验证
+- **langgraph 1.x 经 pip 装入主 venv**（poetry 因 core 漂移解析冲突，未走 poetry add）；pyproject 已手工登记 `langgraph = ">=1.0"`、`matplotlib = ">=3.10"`
 - `get_settings()` 有 lru_cache：改 .env 不热生效，重启进程
 - 对话历史在 SQLite（`backend/chat_memory.db`，gitignore 忽略），刷新页面自动恢复
 - 语义切分对每句调一次 embedding API（计费 + 耗时），auto 模式只对 <3000 字符短文档启用
