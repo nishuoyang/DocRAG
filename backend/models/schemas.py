@@ -41,6 +41,12 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = Field(default_factory=list, description="历史对话（不含当前问题），用于多轮上下文")
 
 
+class AgentChatRequest(BaseModel):
+    query: str = Field(min_length=1, description="用户问题（主管 agent 将拆解并调度成员）")
+    top_k: int | None = Field(default=None, ge=1, le=20, description="文档检索返回块数，默认取配置值 5")
+    history: list[ChatMessage] = Field(default_factory=list, description="历史对话（不含当前问题）")
+
+
 class ChatResponse(BaseModel):
     answer: str = Field(description="LLM 生成的回答")
     sources: list[Source] = Field(description="回答引用的文档块来源")
