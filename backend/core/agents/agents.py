@@ -162,3 +162,95 @@ async def data_agent(question: str, data: str) -> dict:
     """
     result = await _data_analyze(question, data)
     return result.model_dump()
+
+
+WRITER_TEMPLATES = {
+    "report": """基于以下材料写一份结构清晰的中文报告（标题 + 分节 + 结论）。材料：
+{materials}
+
+要求：忠实于材料；信息不足处标注「材料未提供」；使用 markdown 格式。""",
+    "compare": """基于以下材料，输出 A/B 对比分析：先给结论，再用 markdown 表格逐维度对比，最后给建议。材料：
+{materials}""",
+    "weekly": """基于以下材料编写一份中文周报（本周进展 / 问题与风险 / 下周计划 三节）。材料：
+{materials}""",
+}
+
+
+@tool
+async def writer_agent(materials: str, style: str = "report") -> dict:
+    """把已有材料整理成正式成稿（报告/对比/周报）。
+
+    输入 materials：其他 agent 产出的材料文本；style：report/compare/weekly。
+    适合：最终汇总输出阶段，把检索与分析结果组织成文档。
+    """
+    if style not in WRITER_TEMPLATES:
+        style = "report"
+    chat = llm.get_llm()
+    resp = await chat.ainvoke(WRITER_TEMPLATES[style].format(materials=materials))
+    return AgentResult(content=resp.content).model_dump()
+
+
+MULTIHOP_PROMPT = """你负责把复杂问题拆成相互独立的子问题，逐个子问题在文档库中查询并回答，最后汇总成完整答案。
+之前各轮结果（未解决子问题会带下来）：
+{history}
+
+当前待解决问题：{question}
+
+要求：
+1. 拆成 2-4 个可在文档库中直接查证的子问题，每行一个，不要编号前缀（格式：问题）。
+2. 每个子问题必须能在同一文档库中独立检索到答案。
+3. 若问题已经是原子问题，只输出该问题本身。"""
+
+
+async def _multi_hop(question: str, max_rounds: int = 3) -> AgentResult:
+    """拆解 → 逐子问题 RAG → 未解决的带下去重试 → 汇总。超轮次返回已有结论。"""
+    chat = llm.get_llm()
+    pending = [question]
+    solved: list[tuple[str, str]] = []  # (子问题, 答案)
+    all_sources: list[dict] = []
+    for _ in range(max_rounds):
+        if not pending:
+            break
+        history = "\n".join(f"Q: {q}\nA: {a}" for q, a in solved)
+        # 分解（或上一轮未解决的重新分解）
+        resp = await chat.ainvoke(MULTIHOP_PROMPT.format(question="\n".join(pending), history=history))
+        subs = [line.strip().lstrip("0123456789.- ") for line in resp.content.splitlines() if line.strip()]
+        if not subs:
+            subs = pending
+        pending = []
+        for sub in subs:
+            sub = sub[:200]
+            doc = await _documents_rag(sub)
+            all_sources.extend(doc.sources)
+            if "未找到" in doc.content or "尚未检索到" in doc.content:
+                pending.append(sub)  # 下轮换表述重查
+            else:
+                solved.append((sub, doc.content))
+    if not solved:
+        return AgentResult(content="多跳查证未能从文档库获得有效结论。", sources=_dedup_sources(all_sources))
+    summary = await chat.ainvoke(
+        "基于以下子问题答案，回答原始问题：{q}\n\n{detail}".format(
+            q=question, detail="\n\n".join(f"关于「{q}」：{a}" for q, a in solved)
+        )
+    )
+    return AgentResult(content=summary.content, sources=_dedup_sources(all_sources))
+
+
+def _dedup_sources(sources: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out = []
+    for s in sources:
+        key = s.get("content", "")[:100]
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+@tool
+async def multi_hop_agent(question: str, context: str = "") -> dict:
+    """把需要多步查证的问题拆成子问题，逐个在文档库中检索回答并汇总。
+
+    适合：交叉引用型问题（「A 文件提到的迁移政策的原文出处」「两个政策之间的关系」）。
+    """
+    return (await _multi_hop(question)).model_dump()
