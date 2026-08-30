@@ -104,3 +104,50 @@ export async function chatStream(query, topK, onDelta, history = []) {
   }
   return { answer, sources }
 }
+
+// 多 agent 主管流式对话：onEvent 收到 { type: 'activity'|'delta'|'sources'|'done'|'error', ... }。
+// 返回 { answer, sources }。
+export async function agentStream(query, onEvent, history = []) {
+  const res = await fetch('/agent/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, history }),
+  })
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`
+    try {
+      detail = (await res.json()).detail || detail
+    } catch { /* ignore */ }
+    throw new Error(detail)
+  }
+  if (!res.body) throw new Error('浏览器不支持流式响应')
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let answer = ''
+  let sources = []
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const events = buffer.split('\n\n')
+    buffer = events.pop() ?? ''
+    for (const raw of events) {
+      for (const line of raw.split('\n')) {
+        if (!line.startsWith('data: ')) continue
+        const payload = line.slice(6)
+        if (payload === '[DONE]') break
+        try {
+          const data = JSON.parse(payload)
+          if (data.event === 'activity') onEvent({ type: 'activity', agent: data.agent, message: data.message })
+          if (data.event === 'delta') { answer += data.text; onEvent({ type: 'delta', text: data.text }) }
+          if (data.event === 'sources') { sources = data.sources; onEvent({ type: 'sources', sources: data.sources }) }
+          if (data.event === 'done') onEvent({ type: 'done' })
+        } catch { /* 跳过无法解析的行 */ }
+      }
+    }
+  }
+  return { answer, sources }
+}

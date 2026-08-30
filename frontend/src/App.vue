@@ -2,12 +2,14 @@
 import { ref } from 'vue'
 import DocManager from './components/DocManager.vue'
 import ChatPanel from './components/ChatPanel.vue'
+import AgentPanel from './components/AgentPanel.vue'
 
 const tabs = [
+  { key: 'agents', label: '研究助理', icon: '🛰️' },
   { key: 'chat', label: '智能问答', icon: '💬' },
   { key: 'docs', label: '文档管理', icon: '📚' },
 ]
-const activeTab = ref('chat')
+const activeTab = ref('agents')
 </script>
 
 <template>
@@ -37,7 +39,8 @@ const activeTab = ref('chat')
 
     <!-- 右侧内容区 -->
     <main class="flex-1 min-w-0">
-      <ChatPanel v-if="activeTab === 'chat'" />
+      <AgentPanel v-if="activeTab === 'agents'" />
+      <ChatPanel v-else-if="activeTab === 'chat'" />
       <DocManager v-else />
     </main>
   </div>
