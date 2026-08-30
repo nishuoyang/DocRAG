@@ -7,6 +7,7 @@ from langchain_core.tools import tool
 
 from config import get_settings
 from core import llm, retrieval
+from core.agents import data_exec
 from core.agents.schemas import AgentResult
 
 
@@ -110,4 +111,54 @@ async def search_agent(question: str) -> dict:
     适合：文档库之外的最新信息、外部站点内容。
     """
     result = await asyncio.to_thread(_search_web, question)
+    return result.model_dump()
+
+
+DATA_PROMPT = """你是数据分析助手。根据用户问题，编写一段 Python 脚本对数据进行分析。
+要求：
+1. 只能使用 pandas/numpy/matplotlib；数据在变量 DATA_PATH 指向的 CSV 文件中（用 pd.read_csv(DATA_PATH) 读取）。
+2. 图表必须 plt.savefig("chart.png") 且只保存一张；汉字正常显示（matplotlib.rcParams['font.sans-serif']=['SimHei','Microsoft YaHei']，rcParams['axes.unicode_minus']=False）。
+3. 最终把结论用 print 输出，每行一个事实；需要表格时 print 出 markdown 表格。
+4. 不要读取/写入 DATA_PATH 之外任何文件，不要 import 额外库。
+
+数据预览（前 5 行）：
+{preview}
+
+用户问题：{question}
+只输出 Python 代码本身，不要注释说明。"""
+
+
+async def _data_analyze(question: str, data: str) -> AgentResult:
+    """生成脚本 → 执行 → 出错回喂 LLM 修正（最多 2 次）→ 汇总输出。"""
+    preview = "\n".join(data.splitlines()[:5])
+    prompt = DATA_PROMPT.format(preview=preview, question=question)
+    last_output: dict = {}
+    for attempt in range(3):
+        chat = llm.get_llm()
+        resp = await chat.ainvoke(prompt if attempt == 0 else prompt + f"\n\n上次脚本错误：{last_output['error']}\n请修正后重新输出代码。")
+        script = resp.content
+        # 剥掉可能的 ```python 围栏
+        script = script.split("```python")[-1].split("```")[0].strip() if "```" in script else script.strip()
+        try:
+            last_output = await asyncio.to_thread(data_exec.run_script, script, data)
+            break
+        except data_exec.DataExecError as exc:
+            last_output = {"error": str(exc)}
+        except Exception as exc:  # 兜底：任何未预期异常也喂回修正
+            last_output = {"error": f"{type(exc).__name__}: {exc}"}
+    if "error" in last_output:
+        return AgentResult(content=f"数据分析失败：{last_output['error']}")
+    images = last_output.get("images", [])
+    content = last_output["stdout"].strip() or "分析完成（无文本输出）。"
+    return AgentResult(content=f"分析结果（data）：\n{content[:2000]}", meta={"images": images} if images else {})
+
+
+@tool
+async def data_agent(question: str, data: str) -> dict:
+    """对一段结构化数据（CSV/表格文本）做统计分析与图表。
+
+    输入 data：CSV 或 Markdown 表格原文（可从文档检索结果中提取，或用户直接在问题里粘贴）。
+    适合：数据汇总、对比、趋势、画图。
+    """
+    result = await _data_analyze(question, data)
     return result.model_dump()

@@ -72,11 +72,15 @@ def run_script(script: str, data: str) -> dict:
             for k, v in os.environ.items()
             if not any(t in k.upper() for t in ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"))
         }
+        # 强制子进程 stdout/stderr 用 UTF-8（中文 Windows 默认 cp936，与父进程 text=True 解码不一致会崩）
+        env["PYTHONIOENCODING"] = "utf-8"
         try:
             proc = subprocess.run(
                 [sys.executable, script_path],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=settings.DATA_EXEC_TIMEOUT,
                 cwd=workdir,
                 env=env,
