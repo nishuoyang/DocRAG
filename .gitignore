@@ -35,3 +35,7 @@ backend/.ragas_kg_cache.json
 backend/.ragas_personas.json
 
 uploads/
+
+.agents/
+.codex/
+AGENTS.md
