@@ -12,6 +12,8 @@ from pymilvus import Collection, DataType, connections
 from config import get_settings
 from core.embeddings import get_embeddings
 
+_vectorstore_cache: dict[tuple, Milvus] = {}
+
 
 def _base_collection_name() -> str:
     """Legacy collection name derived only from the embedding model."""
@@ -60,20 +62,18 @@ def _get_collection(collection_name: str | None = None) -> Collection | None:
     return Collection(name)
 
 
-def get_vectorstore() -> Milvus:
-    """返回已连接的 Milvus vectorstore（自动创建 Collection）。
+def clear_vectorstore_cache() -> None:
+    _vectorstore_cache.clear()
 
-    显式声明 metadata schema：chunk_type（semantic/fixed）在新 collection 中
-    成为正式字段；旧 collection（无此字段）中该元数据会丢失。
-    """
-    settings = get_settings()
+
+def _build_vectorstore(*, host: str, port: int, collection_name: str) -> Milvus:
     return Milvus(
         embedding_function=get_embeddings(),
         connection_args={
-            "host": settings.MILVUS_HOST,
-            "port": settings.MILVUS_PORT,
+            "host": host,
+            "port": port,
         },
-        collection_name=get_collection_name(),
+        collection_name=collection_name,
         auto_id=True,
         drop_old=False,
         metadata_schema={
@@ -95,6 +95,23 @@ def get_vectorstore() -> Milvus:
     )
 
 
+def get_vectorstore() -> Milvus:
+    """Return one cached vectorstore per Milvus collection configuration."""
+    settings = get_settings()
+    collection_name = get_collection_name()
+    key = (settings.MILVUS_HOST, settings.MILVUS_PORT, collection_name)
+    vectorstore = _vectorstore_cache.get(key)
+    if vectorstore is None:
+        vectorstore = _build_vectorstore(
+            host=settings.MILVUS_HOST,
+            port=settings.MILVUS_PORT,
+            collection_name=collection_name,
+        )
+        _vectorstore_cache.clear()
+        _vectorstore_cache[key] = vectorstore
+    return vectorstore
+
+
 def add_documents(docs: list[Document]) -> list[str]:
     """写入文档块，返回分配的向量 ID 列表。"""
     vs = get_vectorstore()
@@ -106,6 +123,18 @@ def similarity_search(query: str, k: int | None = None) -> list[Document]:
     settings = get_settings()
     vs = get_vectorstore()
     return vs.similarity_search(query, k=k or settings.TOP_K)
+
+
+def similarity_search_many(queries: list[str], k: int) -> list[list[Document]]:
+    """Batch query embeddings, then run one vector search per query."""
+    if not queries:
+        return []
+    vs = get_vectorstore()
+    try:
+        vectors = get_embeddings().embed_documents(queries)
+    except Exception:
+        return [vs.similarity_search(query, k=k) for query in queries]
+    return [vs.similarity_search_by_vector(vector, k=k) for vector in vectors]
 
 
 def get_all_documents() -> list[Document]:

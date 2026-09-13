@@ -58,15 +58,18 @@ def _table_to_markdown(table: Table) -> str:
 
 def _extract_images_from_paragraph(paragraph: Paragraph, doc: DocxDocument) -> list[bytes]:
     """从段落中提取内嵌图片的二进制数据。"""
-    images = []
-    # 查找段落中的图片关系
-    for rel in paragraph.part.rels.values():
-        if "image" in rel.reltype:
-            try:
-                image_data = rel.target_part.blob
-                images.append(image_data)
-            except Exception:
-                pass
+    images: list[bytes] = []
+    seen_rids: set[str] = set()
+    for blip in paragraph._p.iter(qn("a:blip")):
+        rid = blip.get(qn("r:embed")) or blip.get(qn("r:link"))
+        if not rid or rid in seen_rids:
+            continue
+        seen_rids.add(rid)
+        try:
+            image_part = doc.part.related_parts[rid]
+            images.append(image_part.blob)
+        except Exception:
+            continue
     return images
 
 

@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 
 
 class Source(BaseModel):
+    citation_index: int | None = Field(default=None, description="回答中引用的资料编号")
     filename: str = Field(description="引用来源的文件名")
     chunk_index: int | None = Field(default=None, description="命中的 child 块序号")
     matched_chunk_index: int | None = Field(default=None, description="实际召回命中的 child 块序号")

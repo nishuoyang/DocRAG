@@ -1,7 +1,11 @@
 """VLM 多模态客户端：页面读图（扫描件 OCR）+ 图片描述。"""
 import asyncio
 import base64
+import hashlib
 import logging
+import threading
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from typing import Literal
 
 from openai import AsyncOpenAI
@@ -12,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 # VLM 调用类型
 VLMTask = Literal["page_read", "image_describe"]
+
+
+@dataclass
+class _VLMJobState:
+    processed_count: int = 0
 
 # 页面读图 prompt：扫描件 OCR，按原始版式输出 Markdown
 PAGE_READ_PROMPT = """你是一个文档 OCR 助手。请将这张图片中的文字内容按原始版式提取为 Markdown 格式。
@@ -48,7 +57,12 @@ class VLMClient:
         self.base_url = settings.VLM_BASE_URL
         self.api_key = settings.VLM_API_KEY
         self.max_pages = settings.VLM_MAX_PAGES
-        self.processed_count = 0  # 本次处理计数
+        self._job_state: ContextVar[_VLMJobState | None] = ContextVar(
+            f"vlm_job_state_{id(self)}",
+            default=None,
+        )
+        self._description_cache: dict[tuple[str, str], str] = {}
+        self._cache_lock = threading.Lock()
 
         if self.enabled and not self.api_key:
             logger.warning("VLM_ENABLED=true 但 VLM_API_KEY 未配置，VLM 功能将被禁用")
@@ -61,6 +75,14 @@ class VLMClient:
                 timeout=60.0,
             )
             logger.info(f"VLM 客户端初始化: model={self.model}, max_pages={self.max_pages}")
+
+    def begin_job(self) -> Token:
+        """Start a fresh VLM budget for the current ingestion context."""
+        return self._job_state.set(_VLMJobState())
+
+    def end_job(self, token: Token) -> None:
+        """Restore the previous context-local budget."""
+        self._job_state.reset(token)
 
     async def process_image(
         self,
@@ -79,8 +101,18 @@ class VLMClient:
         if not self.enabled:
             return ""
 
-        # 页数熔断
-        if self.processed_count >= self.max_pages:
+        cache_key = (task, hashlib.sha256(image_data).hexdigest())
+        with self._cache_lock:
+            cached = self._description_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # 每个上传任务独立熔断
+        job_state = self._job_state.get()
+        if job_state is None:
+            job_state = _VLMJobState()
+            self._job_state.set(job_state)
+        if job_state.processed_count >= self.max_pages:
             logger.warning(f"VLM 处理已达上限 ({self.max_pages})，跳过后续处理")
             return ""
 
@@ -110,13 +142,17 @@ class VLMClient:
             )
 
             result = response.choices[0].message.content.strip()
-            self.processed_count += 1
+            job_state.processed_count += 1
 
             # 过滤空结果
             if not result or result.lower() in ["", "空字符串", "无内容", "无法识别"]:
-                return ""
+                result = ""
 
-            logger.debug(f"VLM 处理成功 (task={task}, count={self.processed_count})")
+            with self._cache_lock:
+                self._description_cache[cache_key] = result
+            logger.debug(
+                f"VLM 处理成功 (task={task}, count={job_state.processed_count})"
+            )
             return result
 
         except Exception as e:
@@ -132,8 +168,9 @@ class VLMClient:
         return await self.process_image(image_data, task="image_describe")
 
     def get_processed_count(self) -> int:
-        """获取本次处理的图片/页面数量。"""
-        return self.processed_count
+        """获取当前任务实际调用 VLM 的图片/页面数量。"""
+        job_state = self._job_state.get()
+        return job_state.processed_count if job_state is not None else 0
 
 
 # 全局实例（延迟初始化）

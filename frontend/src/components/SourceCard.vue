@@ -21,6 +21,12 @@ const pageLabel = computed(() => {
       @click="expanded = !expanded"
     >
       <span class="text-gray-400">{{ expanded ? '▾' : '▸' }}</span>
+      <span
+        v-if="source.citation_index != null"
+        class="shrink-0 font-mono text-gray-500"
+      >
+        [{{ source.citation_index }}]
+      </span>
       <span class="truncate">{{ source.filename }}</span>
       <span class="ml-auto text-gray-400 shrink-0">
         {{ pageLabel }}

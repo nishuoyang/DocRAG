@@ -26,6 +26,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pptx import Presentation
 
 from config import get_settings
+from core import answer_cache, bm25
 from core.embeddings import get_embeddings
 from core.vlm import get_vlm_client
 from db import milvus
@@ -305,6 +306,8 @@ def ingest_file(filename: str, content: bytes, split_mode: str | None = None, re
         if not replace:
             raise DuplicateFileError(filename, file_hash)
         milvus.delete_by_hash(file_hash)
+        bm25.invalidate_index()
+        answer_cache.invalidate()
 
     ext = Path(filename).suffix.lower()
     from core.parsers import V2_EXTENSIONS
@@ -316,6 +319,8 @@ def ingest_file(filename: str, content: bytes, split_mode: str | None = None, re
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
+    vlm_client = get_vlm_client()
+    vlm_token = vlm_client.begin_job()
     try:
         if use_v2:
             from core import cleaning
@@ -352,10 +357,12 @@ def ingest_file(filename: str, content: bytes, split_mode: str | None = None, re
                 file_hash=file_hash,
             )
         ids = milvus.add_documents(enriched)
+        bm25.invalidate_index()
+        answer_cache.invalidate()
         _save_original(filename, content, file_hash)
 
         # 获取 VLM 处理计数
-        vlm_pages = get_vlm_client().get_processed_count()
+        vlm_pages = vlm_client.get_processed_count()
 
         return {
             "ids": ids,
@@ -368,6 +375,7 @@ def ingest_file(filename: str, content: bytes, split_mode: str | None = None, re
             "vlm_pages": vlm_pages,
         }
     finally:
+        vlm_client.end_job(vlm_token)
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
@@ -390,4 +398,8 @@ def list_documents() -> list[dict]:
 
 
 def delete_document(filename: str) -> int:
-    return milvus.delete_document(filename)
+    deleted = milvus.delete_document(filename)
+    if deleted:
+        bm25.invalidate_index()
+        answer_cache.invalidate()
+    return deleted

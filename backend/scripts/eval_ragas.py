@@ -83,6 +83,12 @@ from pymilvus import connections  # noqa: E402
 
 from config import get_settings  # noqa: E402
 from core import retrieval  # noqa: E402
+from core.eval_cache import (  # noqa: E402
+    build_cache_fingerprint,
+    load_cache_items,
+    wrap_cache_items,
+)
+from db import milvus  # noqa: E402
 
 # 建立 Milvus 连接（正常由 main.py 启动时建立，脚本需手动；必须用 uri 形式，
 # pymilvus 2.5.18 只传 host/port 会走环境变量分支报 ConnLackConf）
@@ -140,27 +146,82 @@ def load_testset(testset_path: Path) -> tuple[list[str], list[list[str]]]:
     return questions, ground_truths
 
 
-def generate_answer(query: str, top_k: int | None) -> tuple[str, list[Document]]:
+def generate_answer(
+    query: str,
+    top_k: int | None,
+) -> tuple[str, list[Document], dict]:
     """走与 /chat 完全相同的链路：检索 → 拼上下文 → LLM 生成。"""
+    retrieval_start = time.perf_counter()
     docs = retrieval._retrieve(query, top_k)
+    retrieval_s = time.perf_counter() - retrieval_start
     if not docs:
-        return "资料库中尚未检索到相关内容。", []
+        return "资料库中尚未检索到相关内容。", [], {
+            "retrieval_s": round(retrieval_s, 4),
+            "generation_s": 0.0,
+            "context_chars": 0,
+            "source_count": 0,
+        }
     messages = retrieval._build_messages(query, docs)
-    answer = retrieval.llm.get_llm().invoke(messages).content
-    return answer, docs
+    generation_start = time.perf_counter()
+    answer = retrieval._generate_answer(messages).content
+    generation_s = time.perf_counter() - generation_start
+    return answer, docs, {
+        "retrieval_s": round(retrieval_s, 4),
+        "generation_s": round(generation_s, 4),
+        "context_chars": sum(len(doc.page_content) for doc in docs),
+        "source_count": len(docs),
+    }
 
 
-def load_cache() -> dict:
+def load_cache(fingerprint: str) -> dict:
     """读取上次生成的缓存（question → {response, contexts}）。"""
     path = Path(os.getenv("RAGAS_CACHE", str(DEFAULT_CACHE)))
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return load_cache_items(raw, fingerprint)
     return {}
 
 
-def save_cache(cache: dict) -> None:
+def save_cache(cache: dict, fingerprint: str) -> None:
     path = Path(os.getenv("RAGAS_CACHE", str(DEFAULT_CACHE)))
-    path.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+    path.write_text(
+        json.dumps(wrap_cache_items(cache, fingerprint), ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
+
+
+def build_run_fingerprint(top_k: int | None) -> tuple[str, dict]:
+    """Fingerprint all non-secret inputs that can change generated eval answers."""
+    settings_obj = get_settings()
+    docs = milvus.get_all_documents()
+    manifest = {
+        "collection": milvus.get_collection_name(),
+        "schema_version": settings_obj.COLLECTION_SCHEMA_VERSION,
+        "embedding_model": settings_obj.EMBEDDING_MODEL,
+        "embedding_dim": settings_obj.EMBEDDING_DIM,
+        "rerank_enabled": settings_obj.RERANK_ENABLED,
+        "rerank_model": settings_obj.RERANK_MODEL if settings_obj.RERANK_ENABLED else "",
+        "query_transform": settings_obj.QUERY_TRANSFORM,
+        "hyde": settings_obj.HYDE,
+        "retrieval_mode": settings_obj.RETRIEVAL_MODE,
+        "top_k": top_k or settings_obj.TOP_K,
+        "retrieval_candidate_k": settings_obj.RETRIEVAL_CANDIDATE_K,
+        "retrieval_max_parents": settings_obj.RETRIEVAL_MAX_PARENTS,
+        "child_chunk_size": settings_obj.CHILD_CHUNK_SIZE,
+        "parent_chunk_size": settings_obj.PARENT_CHUNK_SIZE,
+        "parent_context_max_chars": settings_obj.PARENT_CONTEXT_MAX_CHARS,
+        "corpus": {
+            "chunks": len(docs),
+            "pk_digest": build_cache_fingerprint(
+                {"pks": sorted(str(d.metadata.get("pk") or "") for d in docs)}
+            ),
+            "max_upload_time": max(
+                (int(d.metadata.get("upload_time") or 0) for d in docs),
+                default=0,
+            ),
+        },
+    }
+    return build_cache_fingerprint(manifest), manifest
 
 
 def override_settings(args: argparse.Namespace) -> dict:
@@ -187,16 +248,37 @@ def restore_and_warn(originals: dict) -> None:
         print("注意：检索开关仅本次脚本运行时覆盖，.env 和服务器配置未改变。")
 
 
+def _aggregate_run_metrics(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    summary = {}
+    for key in ("retrieval_s", "generation_s", "context_chars", "source_count"):
+        values = [float(row[key]) for row in rows if row.get(key) is not None]
+        if not values:
+            continue
+        summary[key] = {
+            "mean": round(float(np.mean(values)), 4),
+            "p50": round(float(np.percentile(values, 50)), 4),
+            "p95": round(float(np.percentile(values, 95)), 4),
+        }
+    return summary
+
+
 def run_generation(
-    questions: list[str], ground_truths: list[list[str]], top_k: int | None, no_cache: bool
+    questions: list[str],
+    ground_truths: list[list[str]],
+    top_k: int | None,
+    no_cache: bool,
+    fingerprint: str,
 ) -> tuple[list[SingleTurnSample], dict, dict]:
     """逐条生成回答（缓存命中复用，否则走检索链路），返回 (samples, cache, 统计)。"""
-    cache = {} if no_cache else load_cache()
+    cache = {} if no_cache else load_cache(fingerprint)
     hit = 0 if no_cache else sum(q in cache for q in questions)
     print(f"加载 {len(questions)} 条测试题（缓存命中 {hit} 条" + ("，--no-cache 强制重新生成" if no_cache else "") + "）\n")
 
     samples = []
     failures = 0
+    latency_rows: list[dict] = []
     for i, (q, refs) in enumerate(zip(questions, ground_truths), 1):
         # ground_truth 为空 → context_recall/context_precision 判分必然异常（NaN），直接跳过并说明
         ref = refs[0] if isinstance(refs, list) else refs
@@ -210,19 +292,26 @@ def run_generation(
             if from_cache:
                 entry = cache[q]
                 answer, contexts = entry.get("response"), entry.get("contexts")
+                metrics = entry.get("metrics") or {}
                 # 缓存数据无效（空回答 / 空上下文，常见于旧缓存或判分失败后回填）→ 强制重新生成
                 if not answer or not answer.strip() or not contexts:
                     print(f"  [{i}/{len(questions)}] 缓存数据无效（空 response/contexts），重新生成")
                     from_cache = False
             if not from_cache:
-                answer, docs = generate_answer(q, top_k)
+                answer, docs, metrics = generate_answer(q, top_k)
                 if not docs:
                     raise RuntimeError("检索为空（资料库缺对应内容）")
                 if not answer or not answer.strip():
                     raise RuntimeError("LLM 返回空回答")
                 contexts = [d.page_content for d in docs]
-                cache[q] = {"response": answer, "contexts": contexts}
-                save_cache(cache)
+                cache[q] = {
+                    "response": answer,
+                    "contexts": contexts,
+                    "metrics": metrics,
+                }
+                save_cache(cache, fingerprint)
+            if metrics:
+                latency_rows.append(metrics)
             samples.append(
                 SingleTurnSample(
                     user_input=q,
@@ -237,7 +326,7 @@ def run_generation(
             print(f"  [{i}/{len(questions)}] 失败: {traceback.format_exc(limit=1).strip().splitlines()[-1]}")
     print(f"\n生成/加载完毕，成功 {len(samples)} 条 / 失败 {failures} 条\n")
 
-    stats = {"hit": hit, "failed": failures}
+    stats = {"hit": hit, "failed": failures, "metrics": _aggregate_run_metrics(latency_rows)}
     return samples, cache, stats
 
 
@@ -376,10 +465,27 @@ def build_markdown_report(meta: dict, df, json_filename: str) -> str:
         f"- Top-K: {meta['top_k']}",
         f"- Query Transformation: {'开启' if meta['query_transform'] else '关闭'}",
         f"- HYDE: {'开启' if meta['hyde'] else '关闭'}",
+        f"- Retrieval Mode: {meta['retrieval_mode']}",
         f"- Rerank: {'开启' if meta['rerank'] else '关闭'}",
         f"- 缓存: 命中 {meta['cache_hits']} 条" + ("（缓存启用）" if meta["cache_enabled"] else "（缓存关闭）"),
         f"- 耗时: {meta['generation_duration_s']}s（生成） + {meta['evaluation_duration_s']}s（评估）",
         "",
+    ]
+    run_metrics = meta.get("run_metrics") or {}
+    if run_metrics:
+        lines += [
+            "## 运行指标",
+            "",
+            "| 指标 | 均值 | P50 | P95 |",
+            "|------|------|-----|-----|",
+        ]
+        for name, values in run_metrics.items():
+            lines.append(
+                f"| {name} | {_fmt(values.get('mean'))} | "
+                f"{_fmt(values.get('p50'))} | {_fmt(values.get('p95'))} |"
+            )
+        lines.append("")
+    lines += [
         "## 全局指标",
         "",
         "| 指标 | 均值 | 最小值 | 25% | 中位数 | 75% | 最大值 |",
@@ -448,12 +554,20 @@ def main() -> None:
         "top_k": args.top_k or get_settings().TOP_K,
         "query_transform": get_settings().QUERY_TRANSFORM,
         "hyde": get_settings().HYDE,
+        "retrieval_mode": get_settings().RETRIEVAL_MODE,
         "rerank": get_settings().RERANK_ENABLED,
     }
     try:
+        cache_fingerprint, corpus_manifest = build_run_fingerprint(args.top_k)
         # ---- 阶段 3：批量生成回答（检索链路 + LLM）----
         t_gen_start = time.time()
-        samples, _cache, gen_stats = run_generation(questions, ground_truths, args.top_k, no_cache)
+        samples, _cache, gen_stats = run_generation(
+            questions,
+            ground_truths,
+            args.top_k,
+            no_cache,
+            cache_fingerprint,
+        )
         t_gen_end = time.time()
     finally:
         # ---- 阶段 4：恢复开关（保持进程内状态干净）----
@@ -488,12 +602,16 @@ def main() -> None:
         "top_k": effective["top_k"],
         "query_transform": effective["query_transform"],
         "hyde": effective["hyde"],
+        "retrieval_mode": effective["retrieval_mode"],
         "rerank": effective["rerank"],
         "judge_raw": args.judge_raw,
         "nan_handling": args.nan_handling,
         "nan_counts": nan_counts,
         "cache_enabled": not no_cache,
+        "cache_fingerprint": cache_fingerprint,
+        "corpus": corpus_manifest["corpus"],
         "cache_hits": gen_stats["hit"],
+        "run_metrics": gen_stats["metrics"],
         "total_questions": len(questions),
         "successful": len(samples),
         "failed": gen_stats["failed"],

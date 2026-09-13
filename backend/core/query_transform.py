@@ -10,7 +10,9 @@
 import logging
 from functools import lru_cache
 
-from core import llm
+from langsmith import traceable
+
+from core import llm, tracing
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +29,23 @@ _HYDE_PROMPT = """你是文档内容生成器。根据用户问题，写一段�
 - 只输出内容本身，不要任何前缀或解释"""
 
 
+def _format_history(history: list[dict] | None) -> str:
+    if not history:
+        return "（无）"
+    lines = []
+    for turn in history[-6:]:
+        role = "用户" if turn.get("role") == "user" else "助手"
+        content = str(turn.get("content") or "").strip()
+        if content:
+            lines.append(f"{role}: {content[:500]}")
+    return "\n".join(lines) if lines else "（无）"
+
+
 @lru_cache(maxsize=256)
 def _llm_complete(prompt: str) -> str:
     """调用 LLM 完成 prompt，失败时返回空串（调用方降级）。"""
     try:
-        chat = llm.get_llm()
+        chat = llm.get_query_llm()
         response = chat.invoke([{"role": "user", "content": prompt}])
         return (response.content or "").strip()
     except Exception as exc:  # 网络错误/限流/超时：降级，不抛出
@@ -39,13 +53,33 @@ def _llm_complete(prompt: str) -> str:
         return ""
 
 
-def transform_query(query: str) -> str:
+@traceable(
+    name="Query Rewrite",
+    run_type="chain",
+    tags=["rag", "query"],
+    process_inputs=tracing.process_query_inputs,
+    process_outputs=tracing.process_text_output,
+)
+def transform_query(query: str, history: list[dict] | None = None) -> str:
     """LLM 改写 query 为检索友好形式；失败返回原文。"""
-    rewritten = _llm_complete(f"{_TRANSFORM_PROMPT}\n\n用户问题：{query}")
+    rewritten = _llm_complete(
+        f"{_TRANSFORM_PROMPT}\n\n最近对话：\n{_format_history(history)}"
+        f"\n\n用户问题：{query}"
+    )
     return rewritten if rewritten else query
 
 
-def hyde_query(query: str) -> str:
+@traceable(
+    name="HYDE Generation",
+    run_type="chain",
+    tags=["rag", "query"],
+    process_inputs=tracing.process_query_inputs,
+    process_outputs=tracing.process_text_output,
+)
+def hyde_query(query: str, history: list[dict] | None = None) -> str:
     """生成假想答案文档（HYDE）；失败返回原文。"""
-    hypo = _llm_complete(f"{_HYDE_PROMPT}\n\n用户问题：{query}")
+    hypo = _llm_complete(
+        f"{_HYDE_PROMPT}\n\n最近对话：\n{_format_history(history)}"
+        f"\n\n用户问题：{query}"
+    )
     return hypo if hypo else query

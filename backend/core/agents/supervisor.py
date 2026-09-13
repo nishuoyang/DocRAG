@@ -15,7 +15,15 @@ from langgraph.graph.message import add_messages
 
 from config import get_settings
 from core import llm, retrieval
-from core.agents.agents import data_agent, documents_agent, multi_hop_agent, search_agent, writer_agent
+from core.agents.agents import (
+    data_agent,
+    documents_agent,
+    multi_hop_agent,
+    reset_agent_top_k,
+    search_agent,
+    set_agent_top_k,
+    writer_agent,
+)
 from db import memory
 
 SUPERVISOR_PROMPT = """你是「研究助理」主管，负责调度成员 agent 完成用户的复合任务，最后自己给出总结回答。
@@ -44,6 +52,7 @@ class AgentState(TypedDict):
     queue: asyncio.Queue
     sources: list[dict]
     final: str
+    force_final: bool
 
 
 async def _emit(state: AgentState, event: str, **payload) -> None:
@@ -59,50 +68,75 @@ async def decide(state: AgentState) -> dict:
         state["messages"] + [HumanMessage(f"[决策轮次 {turns}/{settings.AGENT_MAX_TURNS}]")]
     )
     updated["messages"] = [resp]
-    if not resp.tool_calls:
-        updated["final"] = resp.content or "（无直接回答，请补充问题）"
+    updated["force_final"] = turns >= settings.AGENT_MAX_TURNS
     return updated
 
 
 async def run_tools(state: AgentState) -> dict:
     last: AIMessage = state["messages"][-1]
-    tool_msgs: list[ToolMessage] = []
-    for call in last.tool_calls:
+
+    async def execute(call: dict) -> tuple[str, list[dict], dict]:
         name = call["name"]
         await _emit(state, "activity", agent=name, message="执行中…")
         try:
-            out = await TOOLS_BY_NAME[name].ainvoke(call["args"])
+            out = await asyncio.wait_for(
+                TOOLS_BY_NAME[name].ainvoke(call["args"]),
+                timeout=get_settings().AGENT_TOOL_TIMEOUT,
+            )
+            sources = []
             if isinstance(out, dict):
                 for s in out.get("sources", []):
-                    if s not in state["sources"] and not any(x.get("title") == s.get("title") and x.get("url") == s.get("url") for x in state["sources"]):
-                        state["sources"].append(s)
+                    if s not in sources:
+                        sources.append(s)
             text = out if isinstance(out, str) else str(out)
             await _emit(state, "activity", agent=name, message="完成")
         except Exception as exc:
             text = f"agent 执行失败：{type(exc).__name__}: {exc}"
+            sources = []
             await _emit(state, "activity", agent=name, message=f"失败（{type(exc).__name__}）")
-        tool_msgs.append(ToolMessage(content=str(text), tool_call_id=call["id"]))
+        return str(text), sources, call
+
+    results = await asyncio.gather(*(execute(call) for call in last.tool_calls))
+    tool_msgs: list[ToolMessage] = []
+    for text, sources, call in results:
+        for source in sources:
+            if source not in state["sources"] and not any(
+                x.get("title") == source.get("title") and x.get("url") == source.get("url")
+                for x in state["sources"]
+            ):
+                state["sources"].append(source)
+        tool_msgs.append(ToolMessage(content=text, tool_call_id=call["id"]))
     return {"messages": tool_msgs}
 
 
-async def force_final(state: AgentState) -> dict:
-    """超轮次：不带工具强行收尾。"""
+async def final_answer(state: AgentState) -> dict:
+    """Generate the final answer as a real token stream."""
     chat = llm.get_llm()
-    resp = await chat.ainvoke(
-        state["messages"]
-        + [SystemMessage("已达到最大决策轮数。请立即停止调用成员 agent，基于已有结果给出最终总结回答。")]
-    )
-    return {"messages": [resp], "final": resp.content}
+    messages = state["messages"]
+    if state.get("force_final"):
+        messages = messages + [
+            SystemMessage(
+                "已达到最大决策轮数。请立即停止调用成员 agent，基于已有结果给出最终总结回答。"
+            )
+        ]
+    parts: list[str] = []
+    async for chunk in chat.astream(messages):
+        text = chunk.content or ""
+        if text:
+            parts.append(text)
+            await _emit(state, "delta", text=text)
+    answer = "".join(parts)
+    return {"final": answer or "（无直接回答，请补充问题）"}
 
 
 def route(state: AgentState) -> str:
     settings = get_settings()
     if state["turns"] >= settings.AGENT_MAX_TURNS:
-        return "force_final"
+        return "final"
     last = state["messages"][-1]
     if getattr(last, "tool_calls", None):
         return "tools"
-    return END
+    return "final"
 
 
 def build_supervisor_messages(query: str, history: list[dict] | None) -> list:
@@ -117,18 +151,18 @@ def _make_graph():
     g = StateGraph(AgentState)
     g.add_node("decide", decide)
     g.add_node("tools", run_tools)
-    g.add_node("force_final", force_final)
+    g.add_node("final", final_answer)
     g.add_edge(START, "decide")
-    g.add_conditional_edges("decide", route, {"tools": "tools", "force_final": "force_final", END: END})
+    g.add_conditional_edges("decide", route, {"tools": "tools", "final": "final"})
     g.add_edge("tools", "decide")
-    g.add_edge("force_final", END)
+    g.add_edge("final", END)
     return g.compile()
 
 
 GRAPH = _make_graph()
 
 
-async def run(query: str, history: list[dict] | None = None):
+async def run(query: str, history: list[dict] | None = None, top_k: int | None = None):
     """主管执行入口：async generator of SSE 事件 dict。"""
     queue: asyncio.Queue = asyncio.Queue()
     state: AgentState = {
@@ -137,23 +171,24 @@ async def run(query: str, history: list[dict] | None = None):
         "queue": queue,
         "sources": [],
         "final": "",
+        "force_final": False,
     }
     await _emit(state, "activity", agent="supervisor", message="正在分析问题…")
-    task = asyncio.create_task(GRAPH.ainvoke(state))
-    while True:
-        try:
-            event = await asyncio.wait_for(queue.get(), timeout=0.5)
-        except asyncio.TimeoutError:
-            if task.done():
-                break
-            continue
-        yield event
-    final_state = await task
+    token = set_agent_top_k(top_k)
+    try:
+        task = asyncio.create_task(GRAPH.ainvoke(state))
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                if task.done():
+                    break
+                continue
+            yield event
+        final_state = await task
+    finally:
+        reset_agent_top_k(token)
     answer = final_state.get("final", "")
-    # 打字机逐段输出最终回答（前端真实流式的等价实现，避免图内双重 LLM 调用）
-    for i in range(0, len(answer), 8):
-        yield {"event": "delta", "text": answer[i : i + 8]}
-        await asyncio.sleep(0.01)
     sources = final_state.get("sources", [])
     if sources:
         yield {"event": "sources", "sources": sources}

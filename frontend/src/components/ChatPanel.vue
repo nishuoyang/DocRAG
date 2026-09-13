@@ -1,6 +1,7 @@
 <script setup>
 import { ref, nextTick, onMounted } from 'vue'
 import { chatStream, getMemory } from '../api'
+import MarkdownContent from './MarkdownContent.vue'
 import SourceCard from './SourceCard.vue'
 
 const messages = ref([])
@@ -129,12 +130,16 @@ onMounted(async () => {
       <div v-for="(m, i) in messages" :key="i" class="flex" :class="m.role === 'user' ? 'justify-end' : 'justify-start'">
         <div class="max-w-[75%]" :class="m.role === 'user' ? 'order-first' : ''">
           <div
-            class="px-4 py-3 rounded-2xl text-sm whitespace-pre-wrap leading-relaxed"
+            class="px-4 py-3 rounded-2xl text-sm leading-relaxed"
             :class="m.role === 'user'
-              ? 'bg-blue-500 text-white rounded-br-md'
+              ? 'bg-blue-500 text-white rounded-br-md whitespace-pre-wrap'
               : 'bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm'"
           >
-            {{ m.content }}
+            <MarkdownContent
+              v-if="m.role === 'assistant' && m.content"
+              :content="m.content"
+            />
+            <template v-else>{{ m.content }}</template>
             <!-- 流式生成中 -->
             <span v-if="m.streaming" class="inline-flex items-center gap-0.5 ml-1 align-middle">
               <!-- 有内容时显示呼吸光标 -->

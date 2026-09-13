@@ -14,7 +14,7 @@ from db import milvus
 
 logger = logging.getLogger(__name__)
 
-# 缓存：{collection名: (bm25, all_docs)}，collection 变化（上传/删除）时块数变化自动失效
+# 缓存：{collection名: (bm25, all_docs)}，写入/删除后由 ingestion 显式失效
 _index_cache: dict[str, tuple] = {}
 
 
@@ -22,30 +22,35 @@ def _tokenize(text: str) -> list[str]:
     return [w for w in jieba.cut(text) if w.strip()]
 
 
-def _fingerprint(docs: list[Document]) -> tuple[int, int, int]:
-    """Cheap collection generation marker including replacements with equal size."""
-    return (
-        len(docs),
-        max((int(doc.metadata.get("pk") or 0) for doc in docs), default=0),
-        max((int(doc.metadata.get("upload_time") or 0) for doc in docs), default=0),
-    )
+def invalidate_index(collection_name: str | None = None) -> None:
+    """Drop the cached index after the active collection is mutated."""
+    if collection_name:
+        _index_cache.pop(collection_name, None)
+    else:
+        _index_cache.clear()
+
+
+def _index_text(doc: Document) -> str:
+    """Use raw child text so the repeated section prefix does not affect BM25."""
+    raw_text = doc.metadata.get("raw_text")
+    return str(raw_text) if raw_text else doc.page_content
 
 
 def _get_index() -> tuple[BM25Okapi | None, list[Document]]:
     """构建（或复用缓存）BM25 索引，返回 (bm25, 全量文档列表)。"""
     name = milvus.get_collection_name()
-    all_docs = milvus.get_all_documents()
     cached = _index_cache.get(name)
-    if cached and cached[0] == _fingerprint(all_docs):
-        return cached[1], cached[2]
+    if cached:
+        return cached
+    all_docs = milvus.get_all_documents()
     if not all_docs:
-        _index_cache[name] = (_fingerprint(all_docs), None, [])
+        _index_cache[name] = (None, [])
         return None, []
-    tokenized = [_tokenize(d.page_content) for d in all_docs]
+    tokenized = [_tokenize(_index_text(d)) for d in all_docs]
     bm25 = BM25Okapi(tokenized)
     logger.info("BM25 索引重建完成: %d 个块", len(all_docs))
     _index_cache.clear()  # 只保留最新一个库快照
-    _index_cache[name] = (_fingerprint(all_docs), bm25, all_docs)
+    _index_cache[name] = (bm25, all_docs)
     return bm25, all_docs
 
 
@@ -57,7 +62,12 @@ def keyword_search(query: str, k: int = 10) -> list[Document]:
     scores = bm25.get_scores(_tokenize(query))
     # 取分数 > 0 的 top-k（BM25 对无命中词返回 0 分）
     ranked = sorted(zip(scores, all_docs), key=lambda x: x[0], reverse=True)
-    hits = [d for s, d in ranked if s > 0][:k]
-    for d, s in zip(hits, [x[0] for x in ranked[: len(hits)]]):
-        d.metadata["bm25_score"] = round(float(s), 4)
+    hits = [
+        Document(
+            page_content=doc.page_content,
+            metadata={**doc.metadata, "bm25_score": round(float(score), 4)},
+        )
+        for score, doc in ranked
+        if score > 0
+    ][:k]
     return hits

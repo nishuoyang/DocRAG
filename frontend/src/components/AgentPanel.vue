@@ -1,6 +1,7 @@
 <script setup>
 import { ref, nextTick, onMounted } from 'vue'
 import { agentStream, getMemory } from '../api'
+import MarkdownContent from './MarkdownContent.vue'
 
 const messages = ref([])
 const input = ref('')
@@ -107,12 +108,16 @@ onMounted(async () => {
       <div v-for="(m, i) in messages" :key="i" class="flex" :class="m.role === 'user' ? 'justify-end' : 'justify-start'">
         <div class="max-w-[75%]" :class="m.role === 'user' ? 'order-first' : ''">
           <div
-            class="px-4 py-3 rounded-2xl text-sm whitespace-pre-wrap leading-relaxed"
+            class="px-4 py-3 rounded-2xl text-sm leading-relaxed"
             :class="m.role === 'user'
-              ? 'bg-blue-500 text-white rounded-br-md'
+              ? 'bg-blue-500 text-white rounded-br-md whitespace-pre-wrap'
               : 'bg-white border border-gray-200 text-gray-800 rounded-bl-md shadow-sm'"
           >
-            {{ m.content }}
+            <MarkdownContent
+              v-if="m.role === 'assistant' && m.content"
+              :content="m.content"
+            />
+            <template v-else>{{ m.content }}</template>
             <span v-if="m.streaming" class="inline-flex items-center gap-0.5 ml-1 align-middle">
               <span v-if="m.content" class="w-1.5 h-4 bg-blue-400 animate-pulse inline-block" />
               <span v-else class="inline-flex gap-1">

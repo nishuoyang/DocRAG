@@ -233,13 +233,47 @@ def _build_clean_synthesizer(cls, llm):
     这类问题与检索上下文匹配差、拉低 answer_relevancy 且观感差。子类覆盖
     prepare_combinations 只保留正常风格。
     """
-    from ragas.testset.synthesizers.base import QueryStyle
+    from ragas.testset.synthesizers.base import QueryLength, QueryStyle
 
     class CleanStyle(cls):
         def prepare_combinations(self, node, terms, personas, persona_concepts):
-            sample = super().prepare_combinations(node, terms, personas, persona_concepts)
-            sample[0]["styles"] = [QueryStyle.PERFECT_GRAMMAR, QueryStyle.WEB_SEARCH_LIKE]
-            return sample
+            valid_personas = []
+            personas_by_name = {persona.name: persona for persona in personas}
+            for persona_name, concepts in persona_concepts.items():
+                normalized_name = persona_name.split(" (", 1)[0].strip()
+                persona = personas_by_name.get(persona_name)
+                if persona is None:
+                    persona = next(
+                        (
+                            candidate
+                            for candidate in personas
+                            if candidate.name.split(" (", 1)[0].strip() == normalized_name
+                        ),
+                        None,
+                    )
+                lowered_concepts = [str(concept).lower() for concept in concepts]
+                if persona is not None and any(
+                    str(term).lower() in lowered_concepts for term in terms
+                ):
+                    valid_personas.append(persona)
+
+            # The matching prompt can hallucinate persona names. Fall back to
+            # the generated personas rather than failing the whole testset.
+            if not valid_personas:
+                valid_personas = list(personas)
+
+            return [
+                {
+                    "terms": terms,
+                    "node": node,
+                    "personas": valid_personas,
+                    "styles": [
+                        QueryStyle.PERFECT_GRAMMAR,
+                        QueryStyle.WEB_SEARCH_LIKE,
+                    ],
+                    "lengths": list(QueryLength),
+                }
+            ]
 
     return CleanStyle(llm=llm)
 
@@ -306,7 +340,10 @@ def generate_testset(
             if personas is None:
                 save_personas_cache(generator.persona_list)
             samples = list(testset.to_evaluation_dataset().samples)
-            print(f"测试集生成完毕，共 {len(samples)} 题，消耗 token 约 {testset.total_tokens}")
+            print(
+                f"测试集生成完毕，共 {len(samples)} 题，"
+                f"消耗 token 约 {_total_tokens_display(testset)}"
+            )
             return samples
         print(f"缓存节点数 {len(cached.nodes)} 与文档块数 {len(docs)} 不符，重新抽取")
 
@@ -330,7 +367,10 @@ def generate_testset(
     testset = generator.generate(testset_size=size, run_config=run_config, query_distribution=qd)
     save_personas_cache(generator.persona_list)
     samples = list(testset.to_evaluation_dataset().samples)
-    print(f"测试集生成完毕，共 {len(samples)} 题，消耗 token 约 {testset.total_tokens}")
+    print(
+        f"测试集生成完毕，共 {len(samples)} 题，"
+        f"消耗 token 约 {_total_tokens_display(testset)}"
+    )
     return samples
 
 
@@ -356,6 +396,13 @@ def write_testset(samples: list, out_path: Path, strategy: str) -> None:
     lines += ["]", ""]
     out_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"测试集已写入: {out_path}")
+
+
+def _total_tokens_display(testset) -> str:
+    try:
+        return str(testset.total_tokens())
+    except ValueError:
+        return "未启用统计"
 
 
 def main() -> None:

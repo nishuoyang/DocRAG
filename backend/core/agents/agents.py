@@ -1,5 +1,6 @@
 """5 个成员 agent 的工具实现。每个 agent 是 @tool 异步函数，统一输出 AgentResult dict。"""
 import asyncio
+from contextvars import ContextVar, Token
 
 import requests
 
@@ -10,19 +11,29 @@ from core import llm, retrieval
 from core.agents import data_exec
 from core.agents.schemas import AgentResult
 
+_agent_top_k: ContextVar[int | None] = ContextVar("agent_top_k", default=None)
 
-async def _documents_rag(question: str) -> AgentResult:
+
+def set_agent_top_k(top_k: int | None) -> Token:
+    return _agent_top_k.set(top_k)
+
+
+def reset_agent_top_k(token: Token) -> None:
+    _agent_top_k.reset(token)
+
+
+async def _documents_rag(question: str, top_k: int | None = None) -> AgentResult:
     """文档库 RAG 单轮：检索 → 生成。复用现有 retrieval 链路，sources 与 /chat 一致。"""
     settings = get_settings()
-    docs = await asyncio.to_thread(retrieval._retrieve, question, settings.TOP_K)
+    resolved_top_k = top_k or _agent_top_k.get() or settings.TOP_K
+    docs = await asyncio.to_thread(retrieval._retrieve, question, resolved_top_k)
     if not docs:
         return AgentResult(content="资料库中尚未检索到相关内容，请先上传文档或调整问题表述。")
-    chat = llm.get_llm()
     messages = retrieval._build_messages(question, docs, retrieval._resolve_history(None))
-    response = await chat.ainvoke(messages)
+    response = await asyncio.to_thread(retrieval._generate_answer, messages)
     sources = []
-    for document in docs:
-        source = retrieval._source_payload(document)
+    for citation_index, document in retrieval._select_sources(response.content, docs):
+        source = retrieval._source_payload(document, citation_index=citation_index)
         sources.append(
             {
                 **source,

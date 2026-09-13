@@ -15,7 +15,11 @@ async def agent_chat_stream(request: AgentChatRequest):
     """SSE 事件：activity（agent 活动）/ delta（最终回答增量）/ sources（聚合来源）/ done。"""
 
     async def event_stream():
-        async for event in supervisor.run(request.query, request.history):
+        async for event in supervisor.run(
+            request.query,
+            request.history,
+            top_k=request.top_k,
+        ):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

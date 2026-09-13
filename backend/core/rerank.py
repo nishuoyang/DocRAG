@@ -3,10 +3,18 @@
 向量检索（bi-encoder）先召回候选，这里用 rerank 模型（cross-encoder）对
 query 与每个候选块做联合编码，输出相关性分数，按分数重排后返回 Top-N。
 """
+from functools import lru_cache
+
 import httpx
 from langchain_core.documents import Document
 
 from config import get_settings
+
+
+@lru_cache(maxsize=1)
+def get_http_client() -> httpx.Client:
+    """Reuse one keep-alive connection pool for rerank requests."""
+    return httpx.Client(timeout=30)
 
 
 def rerank(query: str, docs: list[Document], top_n: int | None = None) -> list[Document]:
@@ -18,7 +26,7 @@ def rerank(query: str, docs: list[Document], top_n: int | None = None) -> list[D
         return docs  # 开关关闭或未配置 key 时降级为不重排
 
     n = top_n or len(docs)
-    resp = httpx.post(
+    resp = get_http_client().post(
         f"{settings.EMBEDDING_BASE_URL}/rerank",
         headers={"Authorization": f"Bearer {settings.RERANK_API_KEY}"},
         json={
@@ -27,7 +35,6 @@ def rerank(query: str, docs: list[Document], top_n: int | None = None) -> list[D
             "documents": [d.page_content for d in docs],
             "top_n": n,
         },
-        timeout=30,
     )
     resp.raise_for_status()
     # results 按相关性降序，index 指向原列表
@@ -36,7 +43,13 @@ def rerank(query: str, docs: list[Document], top_n: int | None = None) -> list[D
     for item in sorted(results, key=lambda r: r.get("relevance_score", 0), reverse=True):
         idx = item.get("index")
         if isinstance(idx, int) and 0 <= idx < len(docs):
-            doc = docs[idx]
-            doc.metadata["relevance_score"] = item.get("relevance_score")
+            source = docs[idx]
+            doc = Document(
+                page_content=source.page_content,
+                metadata={
+                    **source.metadata,
+                    "relevance_score": item.get("relevance_score"),
+                },
+            )
             ordered.append(doc)
     return ordered

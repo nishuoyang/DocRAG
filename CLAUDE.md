@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-基于 LangChain 的垂直领域智能文档问答系统（RAG）：上传 PDF/DOCX 等 8 种格式 → 结构化解析（v2 引擎）→ 分块向量化存入 Milvus → 混合检索（向量+BM25+Query增强+rerank）→ LLM 生成带来源的回答。**上层叠加多 Agent 研究助理工作台**（LangGraph supervisor 调度 文档/联网/数据/写作/多跳 5 个成员 agent，`/agent/chat/stream` SSE 事件流）。前后端分离：`backend/`（FastAPI）+ `frontend/`（Vue 3）。LLM/Embedding/Rerank 均用 OpenAI 兼容的云 API（Embedding/Rerank 走硅基流动 SiliconFlow，LLM 走 DeepSeek 官方），不运行本地模型。
+基于 LangChain 的垂直领域智能文档问答系统（RAG）：上传 PDF/DOCX 等 8 种格式 → 结构化解析（v2 引擎）→ 父子块分块并向量化存入 Milvus → Query Planning + 向量/BM25 混合召回 → RRF 融合 → Rerank/可答性门控 → Parent 回填 → LLM 生成带引用回答。**上层叠加多 Agent 研究助理工作台**（LangGraph supervisor 并发调度 文档/联网/数据/写作/多跳 5 个成员 agent，`/agent/chat/stream` SSE 事件流）。前后端分离：`backend/`（FastAPI）+ `frontend/`（Vue 3）。LLM/Embedding/Rerank 均用 OpenAI 兼容的云 API，LangSmith tracing 可选。
 
 **v2 升级亮点**：
 - 结构化解析：PDF/DOCX 表格转 Markdown、标题层级识别
@@ -12,6 +12,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - VLM 多模态：扫描件 OCR、内嵌图片描述（硅基流动 Qwen2.5-VL）
 - 异步上传：后台任务处理 + 进度查询
 - 内容哈希去重：避免重复入库
+- 检索分级：`fast` 纯原 query / `balanced` 仅短问题或指代追问改写 / `quality` 开启 Rewrite+HYDE
+- RRF 融合向量与 BM25 排名，Rerank 失败自动回退；低分候选由可答性门控拦截
+- Parent 回填以命中 child 为窗口中心，控制上下文长度并保留章节/页码元数据
+- 进程内答案缓存、LangSmith trace、带指纹的 RAGAS 生成缓存
 
 ## 常用命令
 
@@ -33,7 +37,12 @@ cd frontend && npm run dev      # http://localhost:5173（注意用 localhost �
 # 前端生产构建（产物 frontend/dist/，由 FastAPI 静态托管）
 cd frontend && npm run build
 
-# 测试：无测试套件。手工验证链路：curl /health → POST /documents/upload → POST /chat/stream
+# 后端测试：默认排除 integration，需 Milvus 的用 -m integration
+cd backend && ./.venv/Scripts/python.exe -m pytest
+
+# 前端 Markdown/XSS 冒烟（需前端 dev server + Chrome）
+cd frontend && node scripts/verify-markdown.mjs
+
 # 清空对话记忆：删 backend/chat_memory.db（或在 Python 里调 db.memory.clear_messages()）
 
 # RAGAS 评估（独立 venv，不污染主环境；生成结果缓存在 backend/.ragas_cache.json）
@@ -70,12 +79,13 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 
 ```
 上传 → parsers/（v2 结构化解析：PDF/DOCX 表格转 Markdown、标题层级）
-     → cleaning.py（噪声清洗：页眉页脚剔除）
-     → md_split.py（Markdown 结构感知分块：按章节切分、表格保护）
-     → milvus.py（写入向量，新 schema 含 section/content_type/file_hash/page）
-提问 → query_transform.py（LLM 改写 + HYDE 假想答案，并行）→ 混合检索：
-       milvus 向量召回 + bm25 关键词召回（多查询合并去重）→ rerank.py 精排
-     → llm.py（ChatOpenAI）→ SSE 流式回答 + 来源；问答写入 memory.py（SQLite）
+     → cleaning.py → parent_child.py（child 向量召回 + parent/邻域回填）
+     → milvus.py（写入 child 向量，schema 含 section/content_type/file_hash/page）
+提问 → retrieval.py Query Planning（按 RETRIEVAL_MODE 决定 Rewrite/HYDE）
+     → milvus 向量召回 + bm25 关键词召回（dense/sparse 查询集分开）
+     → RRF 融合 → rerank.py（原始 query）→ Answerability Gate
+     → Parent 窗口回填 → llm.py → SSE 流式回答 + [n] 引用
+     → answer_cache.py；问答写入 memory.py（SQLite）
 ```
 
 ### 后端 `backend/`
@@ -83,30 +93,32 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 - `main.py` — FastAPI 入口。CORS 全开、无认证；启动时校验 Milvus 维度。**静态托管前端 dist 的 mount 必须放在所有 API 路由之后**，否则会抢占 `/health` 等路径
 - `api/documents.py` / `api/chat.py` — 路由层。8 个 endpoint：`GET /health`、`POST /documents/upload`（异步，返回 job_id）、`GET /documents/jobs/{job_id}`（进度查询）、`GET /documents`、`DELETE /documents/{filename}`、`POST /chat`、`POST /chat/stream`（SSE）、`GET /chat/memory`
 - `api/agents.py` — 多 agent 主管路由：`POST /agent/chat/stream`（SSE 事件协议 activity/delta/sources/done，与 /chat/stream 的 delta/sources/[DONE] 协议不同）
-- `core/parsers/` — v2 结构化解析器：`pdf_parser.py`（pymupdf4llm，表格转 GFM）、`docx_parser.py`（python-docx，标题层级+表格）、`pptx_parser.py`（备注页+表格+图片）
+- `core/parsers/` — v2 结构化解析器：`pdf_parser.py`（pymupdf4llm，表格转 GFM）、`docx_parser.py`（python-docx，标题层级+表格+段落图片）、`pptx_parser.py`（备注页+表格+图片）
 - `core/cleaning.py` — 噪声清洗：跨页重复行（页眉/页脚/页码）剔除
 - `core/md_split.py` — Markdown 结构感知分块：按 `#` 标题切节、节内超长 Recursive 切分并前置章节上下文、GFM 表格永不切断、超大表按行分组重复表头
-- `core/vlm.py` — VLM 多模态客户端：页面读图（扫描件 OCR）+ 图片描述，硅基流动 Qwen2.5-VL，页数熔断（默认 30 页）
+- `core/vlm.py` — VLM 多模态客户端：页面读图（扫描件 OCR）+ 图片描述，硅基流动 Qwen2.5-VL；每个上传任务独立预算（默认 30 次调用）并缓存相同图片
 - `core/jobs.py` — 后台任务管理：SQLite 持久化任务状态（pending/processing/completed/failed），支持进度百分比
-- `core/retrieval.py` — 检索 + RAG 生成。`_retrieve` 是唯一检索入口：多查询（原 query + 改写 + HYDE）→ 向量+BM25 合并去重 → rerank（**用原始 query 精排**）→ top_k。`rag_stream` 里 `_retrieve` 放 `asyncio.to_thread` 防阻塞事件循环；流结束把问答写入记忆
-- `core/query_transform.py` — `transform_query`（LLM 改写补指代）+ `hyde_query`（LLM 生成假想答案）。**任何异常降级返回原 query，绝不抛出**；`lru_cache` 按 prompt 缓存
-- `core/bm25.py` — 内存 BM25 索引（rank_bm25 + jieba 中文分词）。缓存键含块数，上传/删除自动重建；语料到万级块需换 Milvus 原生 BM25
+- `core/retrieval.py` — 检索 + RAG 生成。`_retrieve` 是唯一检索入口：Query Planning → dense batch + sparse 检索 → RRF（稳定块 ID）→ rerank（**原始 query**）→ 可答性门控 → parent 窗口回填。`RETRIEVAL_MODE` 控制增强/召回规模和 fast 模式是否跳过 Rerank；`rag_stream` 把 `_retrieve` 放 `asyncio.to_thread`，流结束后按 `[n]` 选择实际引用来源并写记忆
+- `core/query_transform.py` — 基于最近历史做 `transform_query`（LLM 改写补指代）和 `hyde_query`（LLM 生成假想答案）。**任何异常降级返回原 query，绝不抛出**；`lru_cache` 按 prompt 缓存，使用零温度 Query LLM
+- `core/bm25.py` — 内存 BM25 索引（rank_bm25 + jieba 中文分词），索引原始 `raw_text` 而非带章节前缀的 child 文本。上传/删除/替换后由 ingestion 显式 `invalidate_index()`；语料到万级块需换 Milvus 原生全文检索
+- `core/answer_cache.py` / `core/eval_cache.py` — RAG 回答进程内 LRU（集合/query/history/model/检索参数组成 key）；RAGAS 生成缓存带版本和语料/参数指纹
+- `core/tracing.py` — LangSmith `@traceable` 的 compact input/output serializer，避免把完整上下文和密钥写入 trace
 - `core/rerank.py` — SiliconFlow `/rerank` API，`RERANK_ENABLED=false` 或未配 key 时跳过
-- `core/agents/` — 多 agent 研究助理工作台：`supervisor.py`（LangGraph 决策循环 decide↔tools，超轮次 force_final 收尾）→ 5 个成员 agent（`agents.py`：documents 复用 `retrieval._retrieve`、search 走 Tavily/Bocha HTTP、data 生成 pandas 脚本经 `data_exec.py` 白名单子进程执行、writer 模板成稿、multi_hop 拆子问题逐轮查证）；`api/agents.py` 提供 `POST /agent/chat/stream`（SSE 事件：activity/delta/sources/done，最终回答打字机逐段推送，与真实流式等价）
+- `core/agents/` — 多 agent 研究助理工作台：`supervisor.py`（LangGraph decide↔tools，独立工具调用并发执行，超轮次强制收尾，最终回答真实 token 流）→ 5 个成员 agent（`agents.py`：documents 复用 `retrieval._retrieve` 并透传 top_k、search 走 Tavily/Bocha HTTP、data 生成 pandas 脚本经 `data_exec.py` 白名单子进程执行、writer 模板成稿、multi_hop 拆子问题逐轮查证）；`api/agents.py` 提供 `POST /agent/chat/stream`（SSE：activity/delta/sources/done）
 - `core/ingestion.py` — 文档摄入：v2 解析（parsers/）→ 噪声清洗（cleaning.py）→ 结构分块（md_split.py）→ 补充元数据（含 section/content_type/file_hash）→ SHA256 去重 → 写入 Milvus；原件落盘 `backend/uploads/` 支持重解析
-- `core/embeddings.py` / `core/llm.py` — `@lru_cache` 工厂，OpenAI 兼容
-- `db/milvus.py` — Collection 以 Embedding 模型名命名（换模型避免维度冲突）；**新 schema 显式声明 section/content_type/file_hash/page 字段**（page 为 nullable INT64）；`_get_collection()` 直接用 pymilvus 连接（不依赖 embedding 配置），`get_all_documents()`/`delete_document()` 兼容旧 schema（动态检测字段）
+- `core/embeddings.py` / `core/llm.py` — `@lru_cache` 工厂，OpenAI 兼容；`get_llm` 通用、`get_rag_llm` 低温度回答、`get_query_llm` 零温度查询增强
+- `db/milvus.py` — Collection 以 Embedding 模型名命名（换模型避免维度冲突）；**新 schema 显式声明 section/content_type/file_hash/page 字段**（page 为 nullable INT64）；缓存 vectorstore，提供 dense 批量查询；`_get_collection()` 直接用 pymilvus 连接，`get_all_documents()`/`delete_document()` 兼容旧 schema
 - `db/memory.py` — SQLite 单表持久化对话（最近 100 条 = 50 轮，自动截断），单连接 `check_same_thread=False`
-- `models/schemas.py` — Pydantic 模型（请求/响应，含 Swagger 描述），新增 `JobInfoResponse`
-- `config.py` — `Settings`（pydantic-settings）+ `get_settings()` 缓存。**改 .env 后需重启进程，lru_cache 不自动刷新**；新增 `UPLOAD_DIR`、`PARSER_ENGINE`、`VLM_ENABLED`、`VLM_MODEL`、`VLM_API_KEY`、`VLM_BASE_URL`、`VLM_MAX_PAGES`、`SEARCH_PROVIDER`、`SEARCH_API_KEY`、`DATA_EXEC_TIMEOUT`、`AGENT_MAX_TURNS`
+- `models/schemas.py` — Pydantic 模型（请求/响应，含 Swagger 描述）；`Source` 带 `citation_index`，Agent/Chat 请求都支持 `top_k`
+- `config.py` — `Settings`（pydantic-settings）+ `get_settings()` 缓存。**改 .env 后需重启进程，lru_cache 不自动刷新**；关键新增项包括 `RAG_ANSWER_TEMPERATURE`、`QUERY_ENHANCEMENT_TEMPERATURE`、`RETRIEVAL_MODE`、`ANSWERABILITY_GATE_ENABLED`、`RETRIEVAL_MIN_RERANK_SCORE`、`PARENT_WINDOW_RADIUS`、`AGENT_TOOL_TIMEOUT`。API key 字段使用 `repr=False`
 
 ### 评估 `backend/scripts/`
 
-- `eval_ragas.py` — RAGAS 评估（faithfulness / answer_relevancy / context_precision / context_recall）。逐条走真实检索链路 `retrieval._retrieve` 生成回答 → 判分；测试集（questions/ground_truths 列表）在 `docs/test.py`。参数化 CLI：`--testset` / `--top-k` / `--no-transform` / `--no-hyde` / `--no-rerank` / `--no-cache` / `--report-dir`；检索开关靠运行时覆盖 `get_settings()` 单例（pydantic 字段可赋值，进程级生效、不影响 .env）。输出带时间戳的 Markdown + JSON 报告到 `reports/`（gitignore）。**用独立 venv `.venv-ragas/` 运行**（ragas 0.4.3 要求 langchain-core 0.3.x，与主环境 1.5.3 冲突，绝不能装进主 venv）
+- `eval_ragas.py` — RAGAS 评估（faithfulness / answer_relevancy / context_precision / context_recall）。逐条走真实检索链路 `retrieval._retrieve` 生成回答 → 判分；报告包含四指标、context/来源数和检索/生成延迟 P50/P95。参数化 CLI：`--testset` / `--top-k` / `--no-transform` / `--no-hyde` / `--no-rerank` / `--no-cache` / `--report-dir`。**用独立 venv `.venv-ragas/` 运行**（ragas 0.4.3 要求 langchain-core 0.3.x，与主环境冲突，绝不能装进主 venv）
 - `generate_testset.py` — 用 ragas `TestsetGenerator` 从 Milvus 文档库自动合成测试集（questions + 参考答案）。transforms 构建知识图谱（Summary/NER 抽取）→ 合成问题。图谱缓存 `.ragas_kg_cache.json` + personas 缓存 `.ragas_personas.json`（重跑复用，跳过抽取阶段）。中文支持：覆盖合成器 prompt 的 instruction 类属性（不覆盖则生成英文问题，中文库下 context_recall 偏低）。`--style clean` 通过子类化合成器排除错别字风格。**坑**：脚本入口必须 `nest_asyncio.apply()`（ragas 多次 `asyncio.run()` 关闭循环导致 openai client 报 `Event loop is closed`，含 pymilvus 导入时更易触发）；`load_documents()` 过滤空块（ragas 抽取器对空块 `IndexError`）；`default_query_distribution` 传自定义分布时必须带 knowledge_graph 过滤多跳合成器
 - `inspect_chunks.py` — 查看 Milvus 块内容（索引/文件名/关键词筛选），排查检索问题、检查分块质量用。**主环境 venv 即可**（只依赖 milvus 读取）
 - `rebuild_collection.py` — Collection 迁移重建：备份旧数据 → 按新 schema 重建 → 用 `add_embeddings` 回填存量向量（保留原向量，不重新 embedding）
-- `.ragas_cache.json` — 生成结果缓存（question → response + contexts），重跑复用、只重新判分；**改测试集题目/重新上传文档/调检索参数后必须删掉或加 --no-cache**，否则结果是旧库的
+- `.ragas_cache.json` — v2 生成缓存（response + contexts + run metrics），带 collection/文档块指纹/Embedding/Rerank/Query/检索模式/Top-K 指纹。指纹不匹配自动忽略旧结果；`--no-cache` 强制重新生成
 - **`.venv-ragas/` 版本锁定**：pymilvus 2.5.18、langchain-milvus 0.1.10、langchain-core 1.5.3（ragas 装时会把 core 降到 0.3.86，必须 --force-reinstall 回 1.5.3）。另需 `pip install rapidfuzz`（0.4.3 的 `OverlapScoreBuilder` 依赖，默认没装）。评估脚本在模块级 `connections.connect(alias="default", uri=...)`（**必须用 uri 形式**，只传 host/port 会报 ConnLackConf）；指标用 `ragas.metrics` 单例（collections 里的类是 `SimpleBaseMetric` 体系，`evaluate` 的 `isinstance(m, Metric)` 校验不过）；判分 LLM 用 `ChatOpenAI` + 项目 `get_embeddings()`（llm_factory/embedding_factory 的现代实现不兼容旧指标）
 
 ### RAGAS 环境变量（.env）
@@ -125,7 +137,8 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 - 无 Vue Router / Pinia / TypeScript — 单页操作台
 - `src/App.vue` — 左侧导航（聊天 / 文档管理）切换右侧面板
 - `src/api.js` — fetch 封装。`chatStream` 解析 SSE：`data: {json}\n\n` 事件流，支持 `delta`（流式文本）、`sources`（引用）、`answer`（空库兜底）、`[DONE]`；新增 `getJobStatus(jobId)` 查询上传进度
-- `src/components/`：`ChatPanel.vue`（流式对话 + Top-K 滑块 + 打字机渲染 + 首 token 前思考动画）、`AgentPanel.vue`（多 agent 工作台：活动日志 + 流式回答 + 文档/网页双型来源）、`DocManager.vue`（拖拽上传 + 切分策略下拉 + 进度条 + 列表 + 删除）、`SourceCard.vue`（来源展开卡片）
+- `src/components/`：`ChatPanel.vue`（流式对话 + Top-K 滑块 + 打字机渲染）、`AgentPanel.vue`（多 agent 工作台 + 活动日志 + 文档/网页双型来源）、`DocManager.vue`（拖拽上传 + 切分策略下拉 + 进度条 + 列表 + 删除）、`SourceCard.vue`（`[n]` 引用展开卡片）、`MarkdownContent.vue`（marked + DOMPurify 安全 GFM 渲染）
+- `scripts/verify-markdown.mjs` — Playwright 验证两个面板的 Markdown 表格/代码块渲染和 XSS 过滤
 
 ## 关键约束与已知问题
 
@@ -134,6 +147,9 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 - PDF 的 `page` 元数据是 int，docx 无 page（`None`）；**新 schema 中 page 显式声明为 nullable INT64**
 - **内容哈希去重**：同文件重复上传返回 409（可 `replace=true` 覆盖）
 - 上传失败无回滚（临时文件已清理，但部分写入的向量残留）
+- **父块窗口**：`PARENT_WINDOW_RADIUS=1` 默认只回填命中 child 前后各 1 个兄弟块；设为 `-1` 回填完整 parent
+- **答案缓存**：单进程内存 LRU，上传/删除/替换时失效；重启或多 worker 不共享
+- **可答性门控**：仅在拿到 `relevance_score` 且最高分低于 `RETRIEVAL_MIN_RERANK_SCORE` 时拦截；Rerank 失败会回退 RRF 顺序
 - **Collection schema 在建库时定死**：加新 metadata 字段必须 `metadata_schema` 声明 + 重建 collection（现有数据丢失）
 - **依赖版本已漂移**：langchain-core 实际 1.6.1（装 langgraph 1.x 时被升；# 记载原 1.5.3，实际安装时还是 0.3.86——两次过程都有漂移），pyproject 锁 ^0.3.0。当前 Milvus/LLM/multi-agent 链路实测正常，但升依赖前需验证
 - **langgraph 1.x 经 pip 装入主 venv**（poetry 因 core 漂移解析冲突，未走 poetry add）；pyproject 已手工登记 `langgraph = ">=1.0"`、`matplotlib = ">=3.10"`
@@ -142,3 +158,4 @@ cd backend && ./.venv/Scripts/python.exe scripts/inspect_chunks.py
 - 语义切分对每句调一次 embedding API（计费 + 耗时），auto 模式只对 <3000 字符短文档启用
 - 根 `.gitignore` 忽略 `reports/`（评估报告）与 `docs/` 下的测试集文件（`docs/test.py` 等已 tracked 的除外）
 - ragas TestsetGenerator 0.4.3 的 API 限制与踩坑详见 [docs/ragas-testset-issues.md](docs/ragas-testset-issues.md)
+- `backend/main.py` 和 `start.ps1` 当前含 LangSmith key 的调试代码；**公开提交前必须移除并轮换 key**，正式配置只走环境变量

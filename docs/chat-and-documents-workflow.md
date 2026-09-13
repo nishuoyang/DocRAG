@@ -1,6 +1,6 @@
 # Chat 与 Documents 工作流程详解
 
-> 适用版本：v2（结构化解析 + Markdown 分块 + VLM 多模态 + 异步上传）。
+> 适用版本：v2（结构化解析 + 父子块 + RRF 混合检索 + 可答性门控 + 引用 + VLM 多模态 + 异步上传）。
 > 阅读本文前建议先看根目录 `CLAUDE.md` 了解整体架构；本文深入每个接口的内部执行流程。
 
 ---
@@ -10,7 +10,7 @@
 系统由两大模块组成：
 
 - **Documents（文档管理）**：上传 → 结构化解析（v2）→ 噪声清洗 → Markdown 分块 → 向量化 → 入库；以及列表、删除、进度查询。
-- **Chat（智能问答）**：Query 增强（改写+HYDE）→ 混合检索（向量+BM25）→ Rerank 精排 → LLM 生成 → 答案+来源；支持 SQLite 持久化记忆与 SSE 流式输出。
+- **Chat（智能问答）**：Query Planning（Rewrite/HYDE 分档）→ 向量+BM25 混合召回 → RRF 融合 → Rerank + 可答性门控 → Parent 窗口回填 → LLM 生成 → `[n]` 引用；支持 SQLite 持久化记忆、进程内答案缓存与 SSE 流式输出。
 
 ```
 ┌─────────┐   HTTP   ┌──────────────┐   调用    ┌────────────────────────
@@ -54,42 +54,42 @@
 
 **执行步骤**：
 
-1. **格式校验**（[api/documents.py:27-29](backend/api/documents.py#L27-L29)）
+1. **格式校验**（[api/documents.py](../backend/api/documents.py)）
    从 `file.filename` 提取扩展名，白名单 = `ingestion.SUPPORTED_EXTENSIONS` + xlsx/pptx（单一事实源）。
 
-2. **split_mode 校验**（[api/documents.py:31-32](backend/api/documents.py#L31-L32)）
+2. **split_mode 校验**（[api/documents.py](../backend/api/documents.py)）
    仅接受 `auto` / `markdown` / `semantic` / `fixed`，其他返回 400。
 
-3. **大小校验**（[api/documents.py:34-40](backend/api/documents.py#L34-L40)）
+3. **大小校验**（[api/documents.py](../backend/api/documents.py)）
    一次性读入全部字节（`await file.read()`），按 `MAX_UPLOAD_MB`（默认 20MB）判断，超限返回 413。
 
-4. **创建后台任务**（[api/documents.py:42-54](backend/api/documents.py#L42-L54)）
+4. **创建后台任务**（[api/documents.py](../backend/api/documents.py)）
    - `job_manager.create_job(filename)` 创建任务记录（SQLite），返回 `job_id`
    - `background_tasks.add_task(_process_document_task, ...)` 添加后台任务
    - 立即返回 `JobInfoResponse`（job_id、filename、status=pending、progress=0）
 
-5. **后台任务处理** `_process_document_task`（[api/documents.py:71-138](backend/api/documents.py#L71-L138)）
+5. **后台任务处理** `_process_document_task`（[api/documents.py](../backend/api/documents.py)）
    - 更新状态为 `processing`，progress=10
-   - 调用 `ingestion.ingest_file()`（[core/ingestion.py:284](backend/core/ingestion.py#L284)），内部流程：
+   - 调用 `ingestion.ingest_file()`（[core/ingestion.py](../backend/core/ingestion.py)），内部流程：
      - **SHA256 去重**：计算文件哈希，若已入库且 `replace=false` 则抛 `DuplicateFileError`
      - **写临时文件**：`NamedTemporaryFile(suffix=ext)`。因为 loader 只接受文件路径，不接受字节流。
-     - **v2 解析** `_load_documents`（[core/parsers/__init__.py](backend/core/parsers/__init__.py)）：
+     - **v2 解析** `_load_documents`（[core/parsers/__init__.py](../backend/core/parsers/__init__.py)）：
        - PDF → `pymupdf4llm` 逐页输出 Markdown（表格转 GFM、标题带 `#` 层级）
        - DOCX → `python-docx` 顺序遍历 body（标题 Heading 1-9 → `#` 层级、表格转 GFM）
        - PPTX → `python-pptx` 逐页提取文本 + 表格
        - XLSX → `pandas` 按 sheet 分行
        - CSV/HTML/TXT/MD → langchain loader
-     - **噪声清洗**（[core/cleaning.py](backend/core/cleaning.py)）：PDF 逐页剔除跨页重复行（页眉/页脚/页码）
-     - **确定切分策略** `_resolve_split_mode`（[core/ingestion.py:221](backend/core/ingestion.py#L221)）：
+     - **噪声清洗**（[core/cleaning.py](../backend/core/cleaning.py)）：PDF 逐页剔除跨页重复行（页眉/页脚/页码）
+     - **确定切分策略** `_resolve_split_mode`（[core/ingestion.py](../backend/core/ingestion.py)）：
        - 手动 `split_mode` 优先
        - `auto` 时 PDF/DOCX 走 `markdown`，其他按 `SEMANTIC_SPLIT` 配置（<3000 字符语义、否则固定）
-     - **分块** `_split_documents`（[core/ingestion.py:234](backend/core/ingestion.py#L234)），返回 `(结果，实际策略)`：
-       - **markdown**（[core/md_split.py](backend/core/md_split.py)）：按 `#` 标题切节 → 节内文本超长 Recursive 切分（每块前置 `[章节：path]`）→ GFM 表格永不切断、超大表按行分组重复表头 → `chunk_type="markdown"`
+     - **分块** `_split_documents`（[core/ingestion.py](../backend/core/ingestion.py)），返回 `(结果，实际策略)`：
+       - **markdown**（[core/md_split.py](../backend/core/md_split.py)）：按 `#` 标题切节 → 节内文本超长 Recursive 切分（每块前置 `[章节：path]`）→ GFM 表格永不切断、超大表按行分组重复表头 → `chunk_type="markdown"`
        - **fixed**：`RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)`
        - **semantic**：按句切 → 批量 embedding → 相邻句余弦相似度 → 断点 = 低于 `均值 -1.5σ` → 按断点合并成块
-     - **补充元数据** `_make_metadata_docs`（[core/ingestion.py:194](backend/core/ingestion.py#L194)）：为每个块添加 `filename`、`chunk_index`、`upload_time`、`chunk_type`、`section`（章节路径）、`content_type`（text/table）、`file_hash`（SHA256）；PDF/pptx 额外保留 `page`
-     - **写入向量库** `milvus.add_documents(enriched)`（[db/milvus.py:51](backend/db/milvus.py#L51)）
-     - **原件落盘** `_save_original`（[core/ingestion.py:260](backend/core/ingestion.py#L260)）：哈希命名存入 `backend/uploads/`，支持后续重解析
+     - **补充元数据** `_make_metadata_docs`（[core/ingestion.py](../backend/core/ingestion.py)）：为每个块添加 `filename`、`chunk_index`、`upload_time`、`chunk_type`、`section`（章节路径）、`content_type`（text/table）、`file_hash`（SHA256）；PDF/pptx 额外保留 `page`
+     - **写入向量库** `milvus.add_documents(enriched)`（[db/milvus.py](../backend/db/milvus.py)）
+     - **原件落盘** `_save_original`（[core/ingestion.py](../backend/core/ingestion.py)）：哈希命名存入 `backend/uploads/`，支持后续重解析
    - 更新状态为 `completed`，progress=100，保存 result（chunk_count、chunk_type、file_hash、vlm_pages）
    - 异常时更新为 `failed`，保存 error 信息
 
@@ -117,7 +117,7 @@
 
 **执行步骤**：
 
-1. `job_manager.get_job(job_id)`（[core/jobs.py:87](backend/core/jobs.py#L87)）：
+1. `job_manager.get_job(job_id)`（[core/jobs.py](../backend/core/jobs.py)）：
    - 从 SQLite 查询任务记录
    - 不存在 → 返回 404
 
@@ -160,13 +160,13 @@
 
 **执行步骤**：
 
-1. `milvus.get_all_documents()`（[db/milvus.py:64](backend/db/milvus.py#L64)）：
+1. `milvus.get_all_documents()`（[db/milvus.py](../backend/db/milvus.py)）：
    - **直接用 pymilvus Collection 查询**（不依赖 embedding 配置，避免 `EMBEDDING_API_KEY` 为空时报错）
    - **动态检测可用字段**，兼容旧 schema（无 section/content_type/file_hash/page 字段也能正常读取）
    - 用底层 `col.query` 分页拉取全部数据（每批 100 条，`offset` 递增直到取完）
    - 每条数据重建为 `Document`，元数据含 `pk`/`filename`/`chunk_index`/`upload_time`/`chunk_type`/`section`/`content_type`/`file_hash`/`page`
 
-2. `ingestion.list_documents()`（[core/ingestion.py:348](backend/core/ingestion.py#L348)）：
+2. `ingestion.list_documents()`（[core/ingestion.py](../backend/core/ingestion.py)）：
    - 按 `filename` 聚合：同文件所有 chunk 合并为一条记录，`chunk_count` 累计块数
    - 按 `upload_time` 降序排序（新上传的在前）
 
@@ -176,7 +176,7 @@
 
 **执行步骤**：
 
-1. `ingestion.delete_document(filename)` → `milvus.delete_document(filename)`（[db/milvus.py:115](backend/db/milvus.py#L115)）：
+1. `ingestion.delete_document(filename)` → `milvus.delete_document(filename)`（[db/milvus.py](../backend/db/milvus.py)）：
    - collection 不存在 → 返回 0
    - 构造表达式 `filename == "<filename>"`，用底层 `col.delete` 删除**该文件名对应的全部向量块**
    - `col.flush()` 保证删除对后续查询可见
@@ -220,88 +220,99 @@
         ▼
  rag_stream: _retrieve 放 asyncio.to_thread 执行（不阻塞事件循环）
         │
-        ├─ ③ _build_search_queries: 原 query + 改写 + HYDE 并行（ThreadPoolExecutor）
-        │      └─ LLM 失败 → 降级原 query（绝不抛出）
+        ├─ ② _resolve_history: 前端 history 优先，否则 SQLite 最近 6 轮
+        ├─ ③ 查询 answer_cache: 相同问题/历史/模型/检索配置直接返回
+        ├─ ④ Query Planning: 按 RETRIEVAL_MODE 决定 Rewrite/HYDE
+        │      ├─ fast: 只用原 query
+        │      ├─ balanced: 仅短问题/指代追问 Rewrite，不做 HYDE
+        │      └─ quality: Rewrite + HYDE；HYDE 只进 dense 查询集
         │
-        ├─ ④ 每个查询分别做：向量检索 (10 条) + BM25 检索 (10 条)
-        │      └─ 全部合并去重（按文本内容）→ 候选池（最多 ~30 条）
+        ├─ ⑤ 混合召回: 原 query 向量+BM25；增强 query 分别召回
+        │      └─ dense 多查询批量 embedding；sparse 不接收 HYDE
         │
-        ├─ ⑤ rerank.rerank(原始 query, 候选，top_n=top_k)
-        │      └─ SiliconFlow bge-reranker-v2-m3 交叉编码 → 相关性分数排序
-        │      └─ 未配置/关闭 → 跳过，取候选前 top_k
-        │
-        ├─ ⑥ 无结果？ → yield {"answer": "资料库中尚未检索到相关内容..."} → 结束
-        │
-        ├─ ⑦ _resolve_history: 前端 history 优先，否则 SQLite 记忆取最近 6 轮
-        │
-        ├─ ⑧ _build_messages: system(提示词 + 参考资料) + history + query
-        │
-        ├─ ⑨ chat.astream(messages) 流式调用 LLM
-        │      └─ 每个 chunk → yield {"delta": "..."}   ← 逐字推送
-        │
-        ├─ ⑩ 结束后 yield {"sources": [...]}            ← 引用来源
-        │
-        ├─ ⑪ yield "data: [DONE]"                      ← 流结束标记
-        │
-        └─ ⑫ 写记忆：user=query, assistant=完整回答 → SQLite
+        ├─ ⑥ RRF 融合: 按稳定块 ID 汇总各结果列表排名
+        ├─ ⑦ Rerank: 原始 query 精排；fast 模式跳过；失败回退 RRF
+        ├─ ⑧ Answerability Gate: 最高 rerank 分低于阈值时返回未找到
+        ├─ ⑨ Parent Expansion: 命中 child 前后 PARENT_WINDOW_RADIUS 个兄弟块
+        ├─ ⑩ _build_messages: system(带 [n] 编号资料) + history + query
+        ├─ ⑪ RAG LLM astream → 每个 chunk yield {"delta": "..."}
+        ├─ ⑫ 解析回答中的 [n] → 只返回实际引用 sources → [DONE]
+        └─ ⑬ 写答案缓存 + SQLite 记忆
 ```
 
 **逐步说明**：
 
-**① 请求预处理**（[api/chat.py:33-37](backend/api/chat.py#L33-L37)）
+**① 请求预处理**（[api/chat.py](../backend/api/chat.py)）
 `chat_stream` 返回 `StreamingResponse(event_stream(), media_type="text/event-stream")`。`event_stream` 是异步生成器，每次 `yield` 立即推给前端——SSE 逐字效果的原理：**整个请求生命周期内只建立一个 HTTP 连接，连接不断，数据按事件持续推送**。
 
-**③ 查询集构造**（[core/retrieval.py:46](backend/core/retrieval.py#L46) → [core/query_transform.py](backend/core/query_transform.py)）
-- `transform_query`：LLM 把口语/指代不清的问题改写成检索友好查询（补全"它/这个"，提取关键词，扩展同义表述）
-- `hyde_query`：LLM 生成 50-100 字假想答案文档（假设这段就是文档相关段落）
-- 两者 `ThreadPoolExecutor(max_workers=2)` **并行**调用（总延迟 = max 而非相加）；`lru_cache` 缓存（同 query 不重复调 LLM）；**任何异常降级返回原 query**，主流程绝不中断
+**② 历史解析**（[core/retrieval.py](../backend/core/retrieval.py)）
+`_resolve_history`：请求显式传 history 时优先使用；否则从 `memory.load_messages()` 读 SQLite 最近 `MAX_HISTORY_TURNS=6` 轮。SQLite 保留最近 50 轮供页面恢复，请求层只携带 6 轮，避免生成上下文过长。
 
-**④ 混合召回**（[core/retrieval.py:64](backend/core/retrieval.py#L64)）
-每个查询分别做：
-- 向量检索 `milvus.similarity_search(q, k=10)`：query → 1024 维向量 → Milvus 相似度检索
-- BM25 检索 `bm25.keyword_search(q, k=10)`（[core/bm25.py](backend/core/bm25.py)）：jieba 中文分词 → 内存倒排索引 → 关键词得分排序。**缓存键含库内块数，上传/删除自动重建**
-- 全部结果按文本内容合并去重
+**③ 答案缓存**
+`answer_cache` 的 key 包含 collection、规范化 query、Top-K、history 指纹、LLM/温度、Query/HYDE、检索模式、Rerank 开关和模型。命中后仍按 SSE 协议发送 `delta + sources + [DONE]` 并写对话记忆。上传、删除、替换文档时调用 `invalidate()` 清空。
 
-**⑤ Rerank 精排**（[core/rerank.py](backend/core/rerank.py)）
+**④ Query Planning**（[core/retrieval.py](../backend/core/retrieval.py) → [core/query_transform.py](../backend/core/query_transform.py)）
+- `RETRIEVAL_MODE=fast`：只检索原 query，不做远程 Rerank。
+- `RETRIEVAL_MODE=balanced`（默认）：只有指代/承接类追问或长度 ≤12 的问题才调用 Rewrite；不做 HYDE。
+- `RETRIEVAL_MODE=quality`：按 `QUERY_TRANSFORM` / `HYDE` 开关开启增强；带精确标识符的问题仍跳过增强。
+- `transform_query` 使用最近 6 轮历史补全指代；`hyde_query` 生成假想答案。
+- 两个 LLM 调用可并行；`lru_cache` 按 prompt 缓存；任何异常都降级为原 query，不中断主链路。
+- HYDE 只进入 dense 查询集，不进入 BM25，避免假想文本中的关键词污染稀疏召回。
+
+**⑤ 混合召回**
+- 原 query 的向量和 BM25 检索与其他增强任务并行启动。
+- Dense：`milvus.similarity_search_many()` 先批量 embedding，再逐查询走 `similarity_search_by_vector`；批量失败时逐 query 降级。
+- Sparse：`bm25.keyword_search()` 使用 jieba + rank_bm25，索引 child 的 `raw_text`，不带重复的章节前缀。
+- 候选数按模式调整：fast 最小，balanced 中等，quality 使用 `RETRIEVAL_CANDIDATE_K`。
+
+**⑥ RRF 融合**
+每路结果保留自己的排名，用 `1 / (60 + rank)` 累加 Reciprocal Rank Fusion 分数。候选身份优先用 Milvus `pk`，其次 `parent_id + child_index`，最后才用文本哈希，因此相同文本但不同来源不会被误删。融合分数写入 `metadata.rrf_score`。
+
+**⑦ Rerank 精排**（[core/rerank.py](../backend/core/rerank.py)）
 `rerank(query, candidates, top_n)` 调 SiliconFlow `/rerank`（bge-reranker-v2-m3）：
 - query 与每个候选块**联合编码**（cross-encoder），输出相关性分数
 - 按分数降序取 top_n，分数写入 `metadata.relevance_score`
 - **注意：用原始 query 做相关性判断**（用户原意），不用改写/假文档——保证最终排序贴合用户意图
+- `fast` 模式跳过远程 Rerank，直接取 RRF 前 Top-K
+- Rerank 请求失败时记录 warning，并回退 RRF 顺序
 
-**⑦ 记忆解析**（[core/retrieval.py:61](backend/core/retrieval.py#L61)）
-`_resolve_history`：前端传 history 用前端的；否则 `memory.load_messages()`（SQLite 全部）取最近 `MAX_HISTORY_TURNS=6` 轮（12 条）——**存储层保留 50 轮供"续聊"，请求层只取 6 轮防上下文过长稀释检索**。
+**⑧ 可答性门控**
+若已拿到 `relevance_score`，且候选最高分低于 `RETRIEVAL_MIN_RERANK_SCORE`，则判定当前资料库不足以回答，返回空结果和“资料中未找到相关答案”的兜底文案。门控关闭或无分数时不拦截。
 
-**⑧ 构建 messages**（[core/retrieval.py:36](backend/core/retrieval.py#L36)）
+**⑨ Parent 上下文回填**
+命中的是 child，但送给 LLM 的内容会从 `parent_child.py` 原文重建。默认 `PARENT_WINDOW_RADIUS=1`，只取命中 child 前后各一个兄弟块；设为 `-1` 回填完整 parent。重建结果保留 section、page_start/page_end、matched_chunk_index、parent_window_start/end。
+
+**⑩ 构建 messages**（[core/retrieval.py](../backend/core/retrieval.py)）
 ```
 1. system: 系统提示词 + 检索到的参考资料（按 [i] 编号 + 来源文件名）
 2. user/assistant 交替：历史对话（最近 6 轮）
 3. user: 当前问题
 ```
-关键设计：`_format_context` 要求 LLM 只依据资料回答、不编造、数字以原文为准；检索与生成解耦——每次提问重新检索，历史不参与检索，保证回答基于最新入库文档。
+关键设计：`_format_context` 要求 LLM 只依据资料回答、不编造、数字以原文为准，并要求事实性结论使用 `[n]` 引用。历史可用于 Query Rewrite，但候选排序和 Rerank 始终以当前问题为主。
 
-**⑨ 流式生成**（[core/retrieval.py:126](backend/core/retrieval.py#L126)）
-`chat.astream(messages)` 异步迭代 LLM 输出，每个非空 chunk 包装为 `data: {"delta": "..."}\n\n` 推送；`answer_parts` 同时累积完整回答（供记忆持久化）。**全程只 await 不阻塞**。
+**⑪ 流式生成**
+`get_rag_llm().astream(messages)` 使用低温度 RAG LLM；每个非空 chunk 包装为 `data: {"delta": "..."}\n\n` 推送。完整回答同时累积，供引用选择、缓存和记忆持久化。
 
-**⑩ 来源事件**
-`data: {"sources": [...]}`，每条含 `filename` / `chunk_index` / `page` / `content`（完整块文本）。前端据此展示「引用来源」折叠卡片。
+**⑫ 来源事件**
+流结束后解析回答中的 `[n]`，只保留实际引用的文档，并按引用出现顺序返回 `data: {"sources": [...]}`。每条 source 含 `citation_index` / `filename` / chunk/page 元数据 / `content`。如果模型未输出引用，为保证可追溯性返回全部候选来源。
 
-**⑫ 记忆持久化**（[core/retrieval.py:132](backend/core/retrieval.py#L132)）
-流结束后 `memory.add_message("user", query)` + `memory.add_message("assistant", 完整回答)`。SQLite 自动截断到最近 100 条（50 轮）。**空库兜底场景不存**（无 LLM 回答）。`/chat` 单轮在 [api/chat.py:23-25](backend/api/chat.py#L23-L25) 存。
+**⑬ 缓存与记忆**
+完整回答和引用写入 `answer_cache`；`memory.add_message()` 写入 SQLite，自动截断到最近 100 条（50 轮）。**空库/门控兜底场景不写答案缓存**。
 
 **SSE 事件流示例**：
 ```
 data: {"delta": "根据"}
 data: {"delta": "文档"}
 data: {"delta": "内容"}
-data: {"sources": [{"filename": "notes.md", "chunk_index": 2, "page": null, "content": "..."}]}
+data: {"sources": [{"citation_index": 1, "filename": "notes.md", "chunk_index": 2, "page": null, "content": "..."}]}
 data: [DONE]
 ```
 
 ### 3.3 单轮问答 `POST /chat` 的差异
 
-与流式流程完全一致（同样的查询集、混合召回、rerank、消息构建），仅两处不同：
-- 调用 `chat.invoke(messages)` 同步等待完整回答，返回 `ChatResponse {answer, sources}`
-- 记忆写入在 api 层（[api/chat.py:23-25](backend/api/chat.py#L23-L25)），空库回答不存
+与流式流程完全一致（同样的缓存、Query Planning、混合召回、RRF、rerank、门控、Parent 回填），仅输出方式不同：
+- 调用 `_generate_answer()` 同步等待完整回答，返回 `ChatResponse {answer, sources}`
+- 记忆写入在 api 层（[api/chat.py](../backend/api/chat.py)），空库回答不存
 
 ### 3.4 历史记忆：`GET /chat/memory`
 
@@ -309,14 +320,15 @@ data: [DONE]
 
 ### 3.5 前端如何消费 SSE
 
-[frontend/src/api.js](frontend/src/api.js) 的 `chatStream()`：
+[frontend/src/api.js](../frontend/src/api.js) 的 `chatStream()`：
 1. `fetch` 发起 `POST /chat/stream`，不 `await` 响应体，直接拿 `response.body` 的 ReadableStream。
 2. `TextDecoder` 解码二进制流 → 按 `\n\n` 切分事件 → 解析每行 `data: {...}`。
 3. 事件分发：`delta` 追加到当前气泡（逐字效果）、`sources` 存起来、`answer` 显示兜底文案、`[DONE]` 结束。
 
-[ChatPanel.vue](frontend/src/components/ChatPanel.vue) 渲染层：
+[ChatPanel.vue](../frontend/src/components/ChatPanel.vue) 渲染层：
 - **打字机**：SSE 文本先入 `pending` 队列，`setInterval(16ms)` 逐字刷出；真实流式 chunk 到达 ~25ms 直接透传，API 聚合的大段文本被平滑逐字渲染
 - **思考动画**：首 token 前（LLM 生成中）显示三个弹跳点
+- **Markdown**：assistant 内容交给 `MarkdownContent.vue`，marked 解析 GFM 后用 DOMPurify 清洗，支持表格、代码块、列表和安全链接
 - **响应式陷阱**：`messages.value.push()` 后必须**取回数组存储的代理引用**再改 `content`（直接操作原对象不走 Vue setter，不触发渲染）
 
 ---
@@ -343,12 +355,12 @@ data: [DONE]
  │ ── 200 {status, progress}  │                              │                      │
  │                              │                              │                      │
  │  POST /chat/stream ────────▶│                              │                      │
- │  {query}                     │ 改写+HYDE 并行（LLM 2 次）────▶────────────────────▶│
- │                              │ 每个查询：向量+BM25 检索 ────▶│ Embedding 调用 ──────▶│
- │                              │◀─ 候选池（去重） ─────────────│                      │
- │                              │ rerank 精排（原始 query）─────▶────────────────────▶│
- │                              │ 拼 system+history+query       │                      │
- │                              │ chat.astream ────────────────▶────────────────────▶│
+ │  {query}                     │ Query Planning（按模式增强）─▶────────────────────▶│
+ │                              │ 向量+BM25 多路检索 ──────────▶│ Embedding 调用 ──────▶│
+ │                              │◀─ RRF 融合候选池 ────────────│                      │
+ │                              │ rerank + 可答性门控 ─────────▶────────────────────▶│
+ │                              │ Parent 窗口回填 + [n] 引用     │                      │
+ │                              │ rag LLM astream ─────────────▶────────────────────▶│
  │ ◀── data: {"delta":"..."} ──│─ token 流 ──────────────────│◀── token 流 ─────────│
  │ ◀── data: {"sources":[...]} │                              │                      │
  │ ◀── data: [DONE]            │                              │                      │
@@ -370,9 +382,14 @@ data: [DONE]
 | VLM 多模态 | 扫描件 OCR、内嵌图片描述 | 图文混排文档信息不丢失 |
 | 内容哈希去重 | SHA256 哈希，避免重复入库 | 同文件重复上传返回 409（可 replace 覆盖） |
 | 原件落盘 | `backend/uploads/` 哈希命名 | 支持后续重解析/迁移重建 |
-| Query 增强（改写+HYDE） | LLM 补全指代/生成假想答案，扩大召回 | 每轮问答 +2 次 LLM 调用（并行，~3.5s） |
+| 检索模式分档 | fast 低延迟；balanced 默认兼顾延迟与追问；quality 完整 Rewrite+HYDE | 不再每轮固定付两次 LLM 增强成本 |
 | 混合召回 | 向量（语义）+ BM25（关键词）互补 | 专有名词/代码片段靠 BM25 补漏 |
+| RRF 融合 | 保留各路排名，按稳定块 ID 融合 | 避免大库中相同文本被错误去重 |
 | Rerank 用原始 query | 改写/假文档只用于召回，不参与精排 | 最终排序贴合用户原意 |
+| Rerank 降级 | API 异常回退 RRF；fast 模式完全跳过 | Rerank 故障不拖垮问答 |
+| 可答性门控 | rerank 最高分低于阈值时不生成事实回答 | 降低低相关上下文导致的幻觉 |
+| `[n]` 引用 | Prompt 要求句末标注，后端反查实际引用 | 来源卡片与回答一一对应 |
+| Answer Cache | 相同 query/history/model/检索配置复用 | 重复问题降延迟；集合变化自动失效 |
 | 记忆 SQLite 持久化 | 存 50 轮、请求层取 6 轮 | 刷新恢复对话，上下文不膨胀 |
 | Collection 按模型命名 | `doc_collection_BAAI_bge_m3` | 换 Embedding 模型不冲突，但旧库作废需重传 |
 | Collection schema 定死 | `metadata_schema` 显式声明新字段 | 加字段必须重建 collection（数据丢失） |
@@ -387,13 +404,14 @@ data: [DONE]
 | `/documents` 空列表 | collection 尚未创建（首次上传前） | 先上传任意文档；或看后端日志 |
 | 回答与资料无关 | Embedding 模型换了但旧库未重建 | 换模型后需重新上传全部文档 |
 | 流式卡住无输出 | LLM API 不可用/超时 | 看后端日志 httpx 请求状态；直接 curl 测 LLM 接口 |
-| 首 token 很慢（~7s） | 改写+HYDE+rerank 三次 API 调用 | `.env` 关 `QUERY_TRANSFORM`/`HYDE`/`RERANK_ENABLED` 可加速 |
+| 首 token 很慢 | quality 模式叠加 Rewrite/HYDE/Rerank | 改用 `RETRIEVAL_MODE=balanced` 或 `fast`；检查 LangSmith |
 | 改 .env 不生效 | `get_settings()` lru_cache | 重启后端进程 |
 | 上传报错 `文档已入库` | 内容哈希重复 | 前端会提示是否覆盖；或 API 传 `replace=true` |
 | 上传报错 `文档处理失败` | 文件损坏/加密 PDF | 后端日志看具体异常栈 |
 | 删除后列表没变 | 文件名含特殊字符导致表达式匹配失败 | 用 `GET /documents` 确认准确文件名 |
-| VLM 处理页数为 0 | 未配置 `VLM_API_KEY` 或 `VLM_ENABLED=false` | 检查 `.env` 配置 |
+| VLM 处理页数为 0 | 未配置 `VLM_API_KEY` 或 `VLM_ENABLED=false` | 检查 `.env` 配置；同图缓存命中也计 0 |
 | 上传的 chunk_type 是 None | 旧 collection（无该字段） | 重建 collection 后重新上传 |
+| 重复问题仍重新调用 LLM | history 或检索配置不同，answer cache 未命中 | 查看 trace/key 组成；确认没有隐式 history |
 
 ---
 
@@ -423,7 +441,7 @@ questions/ground_truths（docs/test.py）
         │
         ▼
 ① 逐条走真实检索链路 retrieval._retrieve(query, TOP_K=5)
-        │   （改写+HYDE → 向量+BM25 → rerank，与 /chat 完全一致）
+        │   （Query Planning → 向量+BM25 → RRF → rerank/门控，与 /chat 完全一致）
         ▼
 ② LLM 生成回答（同一套 SYSTEM_PROMPT）
         │
@@ -434,13 +452,13 @@ questions/ground_truths（docs/test.py）
 ④ 4 指标判分（Judge LLM = .env 的 DeepSeek，Embedding = SiliconFlow bge-m3）
         │   faithfulness / answer_relevancy / context_precision / context_recall
         ▼
-⑤ 输出逐条明细 + 聚合统计（mean/min/分位数）
+⑤ 输出逐条明细 + RAGAS 指标 + 检索/生成延迟 + context/来源数统计
 ```
 
 **每步细节**：
 
-- **生成缓存**：①-② 结果按 question 存 `.ragas_cache.json`（response + contexts），重跑命中缓存、只重新判分（省 6-7 分钟）。**缓存键是 question 字符串**：新题自动生成并添加，同题覆盖。
-- **缓存失效**：改了测试集题目、重新上传/删除文档、或调了检索参数（TOP_K/分块/rerank）后，**必须 `RAGAS_NO_CACHE=1` 强制重新生成**，否则评估结果是旧库的。
+- **生成缓存**：①-② 结果按 question 存 `.ragas_cache.json`（response + contexts + run metrics）。文件带 `version + fingerprint`，指纹覆盖 collection、文档块/上传时间、Embedding、Rerank、Query、HYDE、RETRIEVAL_MODE、Top-K、分块与 parent 参数。
+- **缓存失效**：指纹不匹配时旧缓存自动忽略，无需手工删除；`--no-cache` 或 `RAGAS_NO_CACHE=1` 强制重新生成。
 - **判分**：指标用 `ragas.metrics` 单例（`faithfulness` 等）；`ragas.metrics.collections` 里的类是 `SimpleBaseMetric` 体系，过不了 `evaluate` 的 `isinstance(m, Metric)` 校验，不能用。判分 LLM 用 `ChatOpenAI` + 项目 `get_embeddings()`（`llm_factory`/`embedding_factory` 的现代实现不兼容旧指标）。
 - **连接**：脚本模块级 `connections.connect(alias="default", uri="http://host:port")`（**必须 uri 形式**，只传 host/port 走环境变量分支报 ConnLackConf）。
 
@@ -449,7 +467,7 @@ questions/ground_truths（docs/test.py）
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `RAGAS_TESTSET` | `docs/test.py` | 测试集路径（相对项目根目录） |
-| `RAGAS_NO_CACHE=1` | 关 | 忽略缓存强制重新生成（换库/调参后必须） |
+| `RAGAS_NO_CACHE=1` | 关 | 忽略指纹缓存，强制重新生成 |
 | `RAGAS_CACHE` | `backend/.ragas_cache.json` | 缓存文件路径 |
 | `RAGAS_LLM_MODEL` / `RAGAS_LLM_BASE_URL` / `RAGAS_LLM_API_KEY` | 复用 .env LLM | 单独指定判分模型 |
 
