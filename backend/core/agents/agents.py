@@ -20,15 +20,16 @@ async def _documents_rag(question: str) -> AgentResult:
     chat = llm.get_llm()
     messages = retrieval._build_messages(question, docs, retrieval._resolve_history(None))
     response = await chat.ainvoke(messages)
-    sources = [
-        {
-            "title": d.metadata.get("filename", "未知来源"),
-            "file": d.metadata.get("filename", "未知来源"),
-            "page": d.metadata.get("page"),
-            "content": d.page_content,
-        }
-        for d in docs
-    ]
+    sources = []
+    for document in docs:
+        source = retrieval._source_payload(document)
+        sources.append(
+            {
+                **source,
+                "title": source["filename"],
+                "file": source["filename"],
+            }
+        )
     return AgentResult(content=response.content, sources=sources)
 
 

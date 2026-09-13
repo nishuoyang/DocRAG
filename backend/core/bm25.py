@@ -22,25 +22,37 @@ def _tokenize(text: str) -> list[str]:
     return [w for w in jieba.cut(text) if w.strip()]
 
 
-def _get_index() -> tuple[BM25Okapi, list[Document]]:
+def _fingerprint(docs: list[Document]) -> tuple[int, int, int]:
+    """Cheap collection generation marker including replacements with equal size."""
+    return (
+        len(docs),
+        max((int(doc.metadata.get("pk") or 0) for doc in docs), default=0),
+        max((int(doc.metadata.get("upload_time") or 0) for doc in docs), default=0),
+    )
+
+
+def _get_index() -> tuple[BM25Okapi | None, list[Document]]:
     """构建（或复用缓存）BM25 索引，返回 (bm25, 全量文档列表)。"""
     name = milvus.get_collection_name()
     all_docs = milvus.get_all_documents()
     cached = _index_cache.get(name)
-    if cached and len(cached[1]) == len(all_docs):
-        return cached
+    if cached and cached[0] == _fingerprint(all_docs):
+        return cached[1], cached[2]
+    if not all_docs:
+        _index_cache[name] = (_fingerprint(all_docs), None, [])
+        return None, []
     tokenized = [_tokenize(d.page_content) for d in all_docs]
     bm25 = BM25Okapi(tokenized)
     logger.info("BM25 索引重建完成: %d 个块", len(all_docs))
     _index_cache.clear()  # 只保留最新一个库快照
-    _index_cache[name] = (bm25, all_docs)
+    _index_cache[name] = (_fingerprint(all_docs), bm25, all_docs)
     return bm25, all_docs
 
 
 def keyword_search(query: str, k: int = 10) -> list[Document]:
     """BM25 关键词检索，返回相关性最高的 k 个块（Document 与向量库同构）。"""
     bm25, all_docs = _get_index()
-    if not all_docs:
+    if bm25 is None or not all_docs:
         return []
     scores = bm25.get_scores(_tokenize(query))
     # 取分数 > 0 的 top-k（BM25 对无命中词返回 0 分）

@@ -54,7 +54,13 @@ def _print_chunk(i: int, doc, full: bool) -> None:
     meta = doc.metadata
     print(f"{'=' * 70}")
     print(f"块 #{i}  来源: {meta.get('filename', '?')}  块序号: {meta.get('chunk_index', '?')}  "
-          f"类型: {meta.get('chunk_type', '?')}  page: {meta.get('page', '-')}  字数: {len(doc.page_content)}")
+          f"类型: {meta.get('chunk_type', '?')}  content: {meta.get('content_type', '-')}  "
+          f"page: {meta.get('page_start') or meta.get('page') or '-'}  字数: {len(doc.page_content)}")
+    if meta.get("parent_id"):
+        print(
+            f"parent: {meta.get('parent_id')}  parent_index: {meta.get('parent_index')}  "
+            f"child_index: {meta.get('child_index')}  section: {meta.get('section') or '-'}"
+        )
     print("-" * 70)
     print(_preview(doc.page_content, full))
     print()

@@ -5,7 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 from config import get_settings
 from core import ingestion
 from core.jobs import get_job_manager, JobStatus
-from models.schemas import DocumentListResponse, DocumentUploadResponse, JobInfoResponse
+from models.schemas import DocumentListResponse, JobInfoResponse
 
 router = APIRouter(prefix="/documents", tags=["文档管理"])
 
@@ -13,11 +13,11 @@ router = APIRouter(prefix="/documents", tags=["文档管理"])
 @router.post("/upload", response_model=JobInfoResponse, summary="上传文档并入库（异步）")
 async def upload_document(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(description="要上传的文档文件，支持 PDF / DOCX"),
-    split_mode: str | None = Form(default=None, description="切分策略：semantic / fixed / markdown，不传则自动判断"),
+    file: UploadFile = File(description="要上传的文档文件，支持 PDF / DOCX / PPTX / XLSX / CSV / HTML / MD / TXT"),
+    split_mode: str | None = Form(default=None, description="切分策略：parent_child / semantic / fixed，不传则自动判断"),
     replace: bool = Form(default=False, description="内容已入库时是否删除旧块重新入库（默认返回 409）"),
 ):
-    """上传 PDF 或 DOCX 文档，后台异步处理解析、分块、向量化后写入 Milvus。
+    """上传支持格式的文档，后台异步处理解析、父子分块和向量化后写入 Milvus。
     
     返回任务 ID，可通过 GET /documents/jobs/{job_id} 查询处理进度。
     """
@@ -28,8 +28,8 @@ async def upload_document(
     if ext not in supported:
         raise HTTPException(status_code=400, detail=f"仅支持 {', '.join(sorted(supported))} 文件")
 
-    if split_mode not in (None, "auto", "semantic", "fixed", "markdown"):
-        raise HTTPException(status_code=400, detail="split_mode 仅支持 auto / semantic / fixed / markdown")
+    if split_mode not in (None, "auto", "parent_child", "semantic", "fixed", "markdown"):
+        raise HTTPException(status_code=400, detail="split_mode 仅支持 auto / parent_child / semantic / fixed")
 
     content = await file.read()
     size_mb = len(content) / (1024 * 1024)

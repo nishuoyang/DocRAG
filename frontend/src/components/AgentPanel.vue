@@ -140,7 +140,10 @@ onMounted(async () => {
               </template>
               <template v-else>
                 <span class="text-gray-700 font-medium">{{ s.title }}</span>
-                <span v-if="s.page" class="text-gray-400 ml-1">p.{{ s.page }}</span>
+                <span v-if="s.section" class="text-gray-400 ml-1">{{ s.section }}</span>
+                <span v-if="s.page_start || s.page" class="text-gray-400 ml-1">
+                  p.{{ s.page_start || s.page }}<template v-if="s.page_end && s.page_end !== (s.page_start || s.page)">-{{ s.page_end }}</template>
+                </span>
               </template>
               <p class="text-gray-500 mt-0.5 line-clamp-2">{{ s.content }}</p>
             </div>

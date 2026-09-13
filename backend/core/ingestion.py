@@ -42,10 +42,6 @@ SUPPORTED_EXTENSIONS = {
     ".html": BSHTMLLoader,
 }
 
-# v2 引擎中可走 Markdown 结构分块的类型（解析器输出带标题层级/表格）
-_MARKDOWN_CAPABLE = {".pdf", ".docx"}
-
-
 class DuplicateFileError(ValueError):
     """上传的文件（按内容哈希）已入库。"""
 
@@ -120,7 +116,7 @@ def _legacy_load_documents(file_path: str) -> list[Document]:
     return _get_loader(file_path)(file_path)
 
 
-# ───────────────────────── 分块（fixed / semantic / markdown）─────────────────────────
+# ───────────────────────── 分块（parent_child / fixed / semantic）─────────────────────────
 
 
 def _make_metadata_docs(
@@ -151,6 +147,12 @@ def _make_metadata_docs(
         content_type = doc.metadata.get("content_type")
         if content_type:
             metadata["content_type"] = content_type
+        metadata["parent_id"] = doc.metadata.get("parent_id", "")
+        metadata["parent_index"] = doc.metadata.get("parent_index", 0)
+        metadata["child_index"] = doc.metadata.get("child_index", idx)
+        metadata["raw_text"] = doc.metadata.get("raw_text", doc.page_content)
+        metadata["page_start"] = doc.metadata.get("page_start", page)
+        metadata["page_end"] = doc.metadata.get("page_end", page)
         if file_hash:
             metadata["file_hash"] = file_hash
         enriched.append(Document(page_content=doc.page_content, metadata=metadata))
@@ -158,16 +160,14 @@ def _make_metadata_docs(
 
 
 def _resolve_split_mode(docs: list[Document], split_mode: str | None) -> str:
-    """确定切分策略：手动指定优先；否则按配置（auto 时短文档语义、长文档固定）。
-
-    markdown 模式：仅当解析引擎为 v2 且文件可输出结构化 Markdown 时生效，
-    否则降级为 auto 逻辑。
-    """
+    """确定切分策略；v2 的 auto/markdown 默认使用 parent_child。"""
     settings = get_settings()
-    if split_mode == "markdown":
-        return split_mode
+    if split_mode in ("markdown", "parent_child"):
+        return "parent_child"
     if split_mode in ("semantic", "fixed"):
         return split_mode
+    if settings.PARSER_ENGINE == "v2":
+        return "parent_child"
     mode = str(settings.SEMANTIC_SPLIT).lower()
     if mode == "auto":
         total_len = sum(len(d.page_content) for d in docs)
@@ -176,22 +176,34 @@ def _resolve_split_mode(docs: list[Document], split_mode: str | None) -> str:
     return "semantic" if mode == "true" else "fixed"
 
 
-def _split_documents(docs: list[Document], split_mode: str | None = None) -> tuple[list[Document], str]:
-    """切分文档，返回 (切分结果, 实际使用的策略)。"""
+def _split_documents(
+    docs: list[Document],
+    split_mode: str | None = None,
+    filename: str = "",
+    file_hash: str = "",
+    upload_time: int | None = None,
+) -> tuple[list[Document], str, int]:
+    """切分文档，返回 (切分结果, 实际策略, parent 数量)。"""
     mode = _resolve_split_mode(docs, split_mode)
-    if mode == "markdown":
-        from core.md_split import split_markdown_documents
+    if mode == "parent_child":
+        from core.parent_child import build_parent_child_documents
 
-        return split_markdown_documents(docs), "markdown"
+        chunks, parent_count = build_parent_child_documents(
+            docs,
+            filename=filename,
+            file_hash=file_hash,
+            upload_time=upload_time or int(time.time()),
+        )
+        return chunks, "parent_child", parent_count
     if mode == "semantic":
-        return _semantic_split_documents(docs), "semantic"
+        return _semantic_split_documents(docs), "semantic", 0
     settings = get_settings()
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=settings.CHUNK_OVERLAP,
         length_function=len,
     )
-    return splitter.split_documents(docs), "fixed"
+    return splitter.split_documents(docs), "fixed", 0
 
 
 # 语义切分：按句子 embedding 相似度断块。
@@ -295,11 +307,9 @@ def ingest_file(filename: str, content: bytes, split_mode: str | None = None, re
         milvus.delete_by_hash(file_hash)
 
     ext = Path(filename).suffix.lower()
-    use_v2 = settings.PARSER_ENGINE == "v2" and ext in _MARKDOWN_CAPABLE
-    # split_mode 解析：v2 可结构化类型 auto 时默认走 markdown 分块
-    effective_split_mode = split_mode
-    if use_v2 and split_mode in (None, "auto"):
-        effective_split_mode = "markdown"
+    from core.parsers import V2_EXTENSIONS
+
+    use_v2 = settings.PARSER_ENGINE == "v2" and ext in V2_EXTENSIONS
 
     suffix = ext if ext in SUPPORTED_EXTENSIONS or ext in (".xlsx", ".pptx") else ".bin"
     # PyPDFLoader / Docx2txtLoader 需要文件路径，写临时文件
@@ -324,8 +334,23 @@ def ingest_file(filename: str, content: bytes, split_mode: str | None = None, re
             raw_docs = _legacy_load_documents(tmp_path)
         if not raw_docs:
             raise ValueError("文档内容为空或无法解析")
-        split_docs, used_mode = _split_documents(raw_docs, effective_split_mode)
-        enriched = _make_metadata_docs(split_docs, filename, chunk_type=used_mode, file_hash=file_hash)
+        upload_time = int(time.time())
+        split_docs, used_mode, parent_count = _split_documents(
+            raw_docs,
+            split_mode,
+            filename=filename,
+            file_hash=file_hash,
+            upload_time=upload_time,
+        )
+        if used_mode == "parent_child":
+            enriched = split_docs
+        else:
+            enriched = _make_metadata_docs(
+                split_docs,
+                filename,
+                chunk_type=used_mode,
+                file_hash=file_hash,
+            )
         ids = milvus.add_documents(enriched)
         _save_original(filename, content, file_hash)
 
@@ -335,6 +360,8 @@ def ingest_file(filename: str, content: bytes, split_mode: str | None = None, re
         return {
             "ids": ids,
             "chunk_count": len(enriched),
+            "child_count": len(enriched),
+            "parent_count": parent_count,
             "filename": filename,
             "chunk_type": used_mode,
             "file_hash": file_hash,

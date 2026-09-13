@@ -6,7 +6,7 @@ import SourceCard from './SourceCard.vue'
 const messages = ref([])
 const input = ref('')
 const sending = ref(false)
-const topK = ref(5)
+const topK = ref(4)
 const scrollBox = ref(null)
 
 // 打字机渲染间隔（毫秒/字）。真实流式时 chunk 到达 ~25ms，16ms/字不会形成瓶颈；
@@ -164,7 +164,7 @@ onMounted(async () => {
     <!-- 输入区 -->
     <div class="px-6 py-4 border-t border-gray-200 bg-white">
       <div class="flex items-center gap-4 mb-3">
-        <span class="text-xs text-gray-500">检索数量 Top-K</span>
+        <span class="text-xs text-gray-500">Parent 数量 Top-K</span>
         <input
           v-model.number="topK"
           type="range"

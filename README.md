@@ -1,7 +1,7 @@
 # 📚 DocRAG · 多 Agent 文档研究工作台
 
 > 上传你的 PDF / DOCX / PPT / Excel…，问它任何问题——单问（RAG 流式问答），或把任务交给**主管 agent**：自动调度文档检索、联网搜索、数据分析、写作汇总、多跳查证，最后成稿。
-> 一套完整的 RAG 工程实践：**结构化解析 → Markdown 分块 → 混合检索 → Query 增强 → Rerank → 流式问答**，上层再叠一层 **LangGraph 多 agent 编排**。
+> 一套完整的 RAG 工程实践：**结构化解析 → 父子块分块 → 混合检索 → Parent 回填 → Rerank → 流式问答**，上层再叠一层 **LangGraph 多 agent 编排**。
 
 ---
 
@@ -26,7 +26,7 @@
 | 🔍 **Query 增强** | LLM 改写补指代 + HYDE 假想答案，并行调用，失败自动降级 |
 | 🎯 **Rerank 精排** | bge-reranker-v2-m3 交叉编码，用**原始 query** 贴合用户意图 |
 | 📄 **结构化解析** | PDF/DOCX 表格转 Markdown、标题层级识别、扫描件 OCR |
-|  **Markdown 分块** | 按章节切分、表格保护、每块带章节上下文 |
+| 🧩 **父子块分块** | child 精准召回 + parent 完整回填，中文句子/表格/代码块边界保护 |
 | 🖼️ **多模态理解** | VLM 描述内嵌图片、扫描件页面读图（硅基流动 Qwen2.5-VL） |
 | ⚡ **异步上传** | 后台任务处理 + 实时进度查询 |
 | 💬 **流式问答** | SSE 逐字输出 + 打字机渲染 + 引用来源卡片 |
@@ -91,7 +91,7 @@ npm run dev                 # http://localhost:5173（注意用 localhost 而非
 ### 5. 开始使用
 
 1. **文档管理** → 拖拽上传（支持 PDF / DOCX / TXT / MD / CSV / XLSX / PPTX / HTML，最大 20MB）
-2. 选择切分策略：**自动**（PDF/DOCX 结构分块、短文档语义、长文档固定）/ 结构分块 / 语义 / 固定
+2. 选择切分策略：**自动父子块**（推荐）/ 父子块 / 语义 / 固定
 3. **智能问答** → 单问，看流式回答 + 引用来源；拖 Top-K 滑块控制检索数量
 4. **研究助理** → 直接把复合任务交给主管 agent，例如：
    - 「北京和上海的首套房首付比例分别是多少？」（单跳文档问答）
@@ -153,7 +153,7 @@ backend/                  FastAPI 后端
 │   │   └── schemas.py    AgentTask / AgentResult
 │   ├── parsers/          v2 结构化解析器（pdf/docx/pptx）
 │   ├── cleaning.py       噪声清洗（页眉页脚剔除）
-│   ├── md_split.py       Markdown 结构感知分块
+│   ├── parent_child.py   原子块、child 召回块与 parent 分组
 │   ├── vlm.py            VLM 多模态客户端
 │   ├── jobs.py           后台任务管理
 │   ├── ingestion.py      文档摄入（解析→清洗→分块→去重→入库）

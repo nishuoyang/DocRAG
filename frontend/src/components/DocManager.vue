@@ -11,12 +11,12 @@ const fileInput = ref(null)
 const progress = ref(0)
 const progressMessage = ref('')
 
-const ALLOWED = ['pdf', 'docx', 'txt', 'md', 'csv', 'xlsx', 'pptx']
-// 切分策略：auto 自动（PDF/DOCX 结构分块、短文档语义、长文档固定）| markdown | semantic | fixed
+const ALLOWED = ['pdf', 'docx', 'txt', 'md', 'csv', 'xlsx', 'pptx', 'html']
+// auto 默认父子块；semantic / fixed 保留为显式兼容策略。
 const splitMode = ref('auto')
 const SPLIT_OPTIONS = [
-  { value: 'auto', label: '自动（结构分块 / 语义 / 固定）' },
-  { value: 'markdown', label: '结构分块（标题层级 + 表格保护）' },
+  { value: 'auto', label: '自动父子块（推荐）' },
+  { value: 'parent_child', label: '父子块（child 召回 + parent 上下文）' },
   { value: 'semantic', label: '语义切分（按话题断块）' },
   { value: 'fixed', label: '固定长度切分（500 字符）' },
 ]

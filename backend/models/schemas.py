@@ -4,9 +4,13 @@ from pydantic import BaseModel, Field
 
 class Source(BaseModel):
     filename: str = Field(description="引用来源的文件名")
-    chunk_index: int | None = Field(default=None, description="命中的文档块序号")
-    page: int | None = Field(default=None, description="命中的页码（PDF 有值）")
-    content: str = Field(description="命中的文档块内容")
+    chunk_index: int | None = Field(default=None, description="命中的 child 块序号")
+    matched_chunk_index: int | None = Field(default=None, description="实际召回命中的 child 块序号")
+    page: int | None = Field(default=None, description="命中内容起始页码（PDF/PPTX 有值）")
+    page_start: int | None = Field(default=None, description="parent 起始页码")
+    page_end: int | None = Field(default=None, description="parent 结束页码")
+    section: str | None = Field(default=None, description="所属章节路径")
+    content: str = Field(description="送入 LLM 的完整 parent 内容，非父子块时为原始 child")
 
 
 class DocumentInfo(BaseModel):
@@ -18,9 +22,11 @@ class DocumentInfo(BaseModel):
 
 class DocumentUploadResponse(BaseModel):
     filename: str = Field(description="已上传的文件名")
-    chunk_count: int = Field(description="入库的分块数量")
+    chunk_count: int = Field(description="入库 child 数量")
     ids: list[int] = Field(description="写入 Milvus 的向量 ID 列表")
-    chunk_type: str | None = Field(default=None, description="实际使用的切分策略：semantic / fixed / markdown")
+    child_count: int = Field(default=0, description="入库 child 数量")
+    parent_count: int = Field(default=0, description="构建的 parent 数量")
+    chunk_type: str | None = Field(default=None, description="实际策略：parent_child / semantic / fixed")
     file_hash: str | None = Field(default=None, description="文件内容 SHA256 哈希")
     vlm_pages: int = Field(default=0, description="VLM 多模态实际处理的页数/图片数（成本可见）")
 

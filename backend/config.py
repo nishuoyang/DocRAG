@@ -33,14 +33,22 @@ class Settings(BaseSettings):
     # 检索与分块
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
-    TOP_K: int = 5
+    TOP_K: int = 4
+    # Parent-child retrieval: children are embedded, parents are reconstructed
+    # from sibling children and supplied to the generation model.
+    CHILD_CHUNK_SIZE: int = 450
+    PARENT_CHUNK_SIZE: int = 2000
+    CHILD_MIN_SIZE: int = 120
+    RETRIEVAL_CANDIDATE_K: int = 20
+    RETRIEVAL_MAX_PARENTS: int = 4
+    PARENT_CONTEXT_MAX_CHARS: int = 8000
+    COLLECTION_SCHEMA_VERSION: str = "parent_child_v1"
     # 多 agent 研究助理工作台
     SEARCH_PROVIDER: str = "tavily"  # 联网搜索服务商：tavily / bocha
     SEARCH_API_KEY: str = ""         # 联网搜索 key；为空时 Search agent 降级不可用
     DATA_EXEC_TIMEOUT: int = 30      # 数据分析子进程超时（秒）
     AGENT_MAX_TURNS: int = 8         # supervisor 最大决策轮数（防死循环）
-    # 语义切分开关：auto 时短文档(<AUTO_SEMANTIC_THRESHOLD)用语义切分、长文档固定切分；
-    # true 全部语义、false 全部固定。上传时可被 split_mode 参数覆盖
+    # legacy 语义切分开关；v2 默认始终使用 parent_child。
     SEMANTIC_SPLIT: str = "auto"
     AUTO_SEMANTIC_THRESHOLD: int = 3000  # 语义切分的文档长度阈值（字符）
     # 检索前 Query 增强

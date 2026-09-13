@@ -2,6 +2,7 @@
 
 同一 Embedding 模型对应一个 Collection（用 EMBEDDING_MODEL 做别名避免维度冲突）。
 """
+import json
 import re
 
 from langchain_milvus import Milvus
@@ -12,11 +13,24 @@ from config import get_settings
 from core.embeddings import get_embeddings
 
 
-def get_collection_name() -> str:
-    """以 Embedding 模型命名集合，避免换模型后维度不匹配。"""
+def _base_collection_name() -> str:
+    """Legacy collection name derived only from the embedding model."""
     settings = get_settings()
     model_slug = re.sub(r"[^A-Za-z0-9_]", "_", settings.EMBEDDING_MODEL)
     return f"{settings.MILVUS_COLLECTION}_{model_slug}"
+
+
+def get_legacy_collection_name() -> str:
+    """Return the pre-parent-child collection name without touching it."""
+    return _base_collection_name()
+
+
+def get_collection_name() -> str:
+    """Return the active schema-versioned collection name."""
+    settings = get_settings()
+    base = _base_collection_name()
+    version = re.sub(r"[^A-Za-z0-9_]", "_", settings.COLLECTION_SCHEMA_VERSION.strip())
+    return f"{base}_{version}" if version else base
 
 
 def _connect_default() -> None:
@@ -33,14 +47,14 @@ def _connect_default() -> None:
         pass
 
 
-def _get_collection() -> Collection | None:
+def _get_collection(collection_name: str | None = None) -> Collection | None:
     """获取 Collection 对象（不依赖 embedding，用于纯查询场景）。
 
     返回 None 表示 collection 不存在。
     """
     _connect_default()
     from pymilvus import utility
-    name = get_collection_name()
+    name = collection_name or get_collection_name()
     if not utility.has_collection(name):
         return None
     return Collection(name)
@@ -67,10 +81,16 @@ def get_vectorstore() -> Milvus:
             "section": {"dtype": DataType.VARCHAR, "max_length": 256},
             "content_type": {"dtype": DataType.VARCHAR, "max_length": 16},
             "file_hash": {"dtype": DataType.VARCHAR, "max_length": 64},
+            "parent_id": {"dtype": DataType.VARCHAR, "max_length": 64},
+            "parent_index": {"dtype": DataType.INT64},
+            "child_index": {"dtype": DataType.INT64},
+            "raw_text": {"dtype": DataType.VARCHAR, "max_length": 65535},
             # page 必须显式声明且 nullable：PDF 有页码、DOCX 无页码，
             # 若不声明，langchain-milvus 会按首批 metadata 建成非空字段，
             # 之后上传无页码文档会报 "Insert missed an field `page`"
             "page": {"dtype": DataType.INT64, "nullable": True},
+            "page_start": {"dtype": DataType.INT64, "nullable": True},
+            "page_end": {"dtype": DataType.INT64, "nullable": True},
         },
     )
 
@@ -103,7 +123,8 @@ def get_all_documents() -> list[Document]:
     available_fields = {f.name for f in col.schema.fields}
     all_metadata_fields = [
         "filename", "chunk_index", "upload_time", "chunk_type",
-        "section", "content_type", "file_hash", "page",
+        "section", "content_type", "file_hash", "parent_id", "parent_index",
+        "child_index", "raw_text", "page", "page_start", "page_end",
     ]
     query_fields = ["pk", "text"]
     for f in all_metadata_fields:
@@ -123,20 +144,82 @@ def get_all_documents() -> list[Document]:
         if not batch:
             break
         for item in batch:
-            metadata = {"pk": item.get("pk")}
-            for f in all_metadata_fields:
-                if f in available_fields:
-                    metadata[f] = item.get(f)
-            documents.append(
-                Document(
-                    page_content=item.get("text", ""),
-                    metadata=metadata,
-                )
-            )
+            documents.append(_row_to_document(item, available_fields))
         if len(batch) < limit:
             break
         offset += limit
     return documents
+
+
+def _row_to_document(item: dict, available_fields: set[str] | None = None) -> Document:
+    fields = available_fields or set(item)
+    metadata = {"pk": item.get("pk")}
+    for field in (
+        "filename",
+        "chunk_index",
+        "upload_time",
+        "chunk_type",
+        "section",
+        "content_type",
+        "file_hash",
+        "parent_id",
+        "parent_index",
+        "child_index",
+        "raw_text",
+        "page",
+        "page_start",
+        "page_end",
+    ):
+        if field in fields:
+            metadata[field] = item.get(field)
+    return Document(page_content=item.get("text", ""), metadata=metadata)
+
+
+def get_children_by_parent_ids(parent_ids: list[str]) -> dict[str, list[Document]]:
+    """Fetch sibling children for virtual parent reconstruction."""
+    unique_ids = list(dict.fromkeys(parent_id for parent_id in parent_ids if parent_id))
+    if not unique_ids:
+        return {}
+    col = _get_collection()
+    if col is None:
+        return {}
+
+    fields = {field.name for field in col.schema.fields}
+    if "parent_id" not in fields:
+        return {}
+    output_fields = [
+        field
+        for field in (
+            "pk",
+            "text",
+            "filename",
+            "chunk_index",
+            "upload_time",
+            "chunk_type",
+            "section",
+            "content_type",
+            "file_hash",
+            "parent_id",
+            "parent_index",
+            "child_index",
+            "raw_text",
+            "page",
+            "page_start",
+            "page_end",
+        )
+        if field in fields or field in {"pk", "text"}
+    ]
+    expression = f"parent_id in {json.dumps(unique_ids, ensure_ascii=True)}"
+    rows = col.query(expr=expression, output_fields=output_fields, limit=10000)
+    grouped: dict[str, list[Document]] = {}
+    for row in rows:
+        document = _row_to_document(row, fields)
+        parent_id = document.metadata.get("parent_id")
+        if parent_id:
+            grouped.setdefault(parent_id, []).append(document)
+    for siblings in grouped.values():
+        siblings.sort(key=lambda doc: doc.metadata.get("child_index") or 0)
+    return grouped
 
 
 def delete_document(file_name: str) -> int:
